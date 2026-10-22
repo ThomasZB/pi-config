@@ -47,6 +47,8 @@
 | 扩展 / 模块 | 功能说明 |
 | :--- | :--- |
 | `plan-mode/` | 只读探索规划模式（`/plan`、`Ctrl+Alt+P`、`/plan-todos`） |
+| `web.ts` | 原生联网搜索与网页抓取工具（`web_search` + `web_fetch`，基于 DeepSeek Search/Fetch API，支持 Tavily / 直连自动兜底） |
+| `compaction-model.ts` | 独立配置上下文压缩与分支摘要模型（`/compact-model`，支持指定 Haiku/Flash 及思考等级，失败自动回退） |
 | `subagent/` + `agents/*.md` | 多子智能体委派（`scout`、`planner`、`reviewer`、`worker`，自动继承当前默认模型） |
 | `questionnaire.ts` | 结构化多选/Tab 交互提问工具 |
 | `todo.ts` | 会话内任务看板工具与 `/todos` 命令 |
@@ -103,6 +105,7 @@ pi install git+https://github.com/ThomasZB/pi-config.git
 | 命令 / 快捷键 | 作用 |
 | :--- | :--- |
 | `/reload` | 热重载所有扩展、主题、智能体与配置（并恢复完整历史视图） |
+| `/compact-model` | 交互式选择或配置独立的上下文压缩模型（如 Haiku / Flash） |
 | `/history` | 切换「保留 Compact 前完整历史记录」vs「仅显示压缩后精简视图」 |
 | `/compact-tools` | 切换「Claude 风格连续命令折叠 + 呼吸灯视图」vs「默认输出」 |
 | `/pretty-md` | 切换「富文本终端 Markdown 卡片渲染」vs「原始 Markdown」 |

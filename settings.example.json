@@ -1,4 +1,8 @@
 {
   "$schema": "https://pi.dev/schemas/settings.schema.json",
-  "theme": "catppuccin-latte/tokyo-night"
+  "theme": "catppuccin-latte/tokyo-night",
+  "defaultTools": ["+grep", "+find", "+ls", "+codemode"],
+  "web": {
+    "deepseekApiKeyEnv": "DEEPSEEK_API_KEY"
+  }
 }

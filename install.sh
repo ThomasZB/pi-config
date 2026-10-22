@@ -56,6 +56,12 @@ else
         if (!data.theme) {
           data.theme = "catppuccin-latte/tokyo-night";
         }
+        if (!data.defaultTools) {
+          data.defaultTools = ["+grep", "+find", "+ls", "+codemode"];
+        }
+        if (!data.web) {
+          data.web = { deepseekApiKeyEnv: "DEEPSEEK_API_KEY" };
+        }
         fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
       } catch (e) {
         console.error("⚠️ 无法自动更新 settings.json，请手动设置 \"theme\": \"catppuccin-latte/tokyo-night\"");

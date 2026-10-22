@@ -994,6 +994,67 @@ function formatSingleToolLine(
 		} else {
 			resultDesc = fg("muted", lineCount > 0 ? `${lineCount} lines` : "written");
 		}
+	} else if (toolName === "web_search") {
+		const q = truncateToWidth(String(args?.query ?? ""), 48, "…");
+		const qStyled = hovered ? rgbFg(COLOR_CYAN, bold(`"${q}"`)) : fg("accent", `"${q}"`);
+		callDesc = `${fg("mdLink", "🌐")} ${fg("toolTitle", bold("web_search"))} ${qStyled}`;
+		if (isPartial) {
+			resultDesc = `${breatheText("Searching", COLOR_CYAN, COLOR_PURPLE, 3.6)} ${renderBreathingWave(COLOR_CYAN, COLOR_PURPLE, ["•", "•", "•"])}`;
+		} else if (isError) {
+			resultDesc = fg("error", "Search failed");
+		} else {
+			const count = result?.details?.resultCount;
+			resultDesc = fg("muted", typeof count === "number" ? `${count} results` : "done");
+		}
+	} else if (toolName === "web_fetch") {
+		const u = truncateToWidth(String(args?.url ?? ""), 52, "…");
+		const uStyled = hovered ? rgbFg(COLOR_CYAN, bold(u)) : fg("mdLink", u);
+		callDesc = `${fg("mdLink", "🔗")} ${fg("toolTitle", bold("web_fetch"))} ${uStyled}`;
+		if (isPartial) {
+			resultDesc = `${breatheText("Fetching", COLOR_CYAN, COLOR_PURPLE, 3.6)} ${renderBreathingWave(COLOR_CYAN, COLOR_PURPLE, ["•", "•", "•"])}`;
+		} else if (isError) {
+			resultDesc = fg("error", "Fetch failed");
+		} else {
+			const chars = result?.details?.charCount;
+			resultDesc = fg("muted", typeof chars === "number" ? `${(chars / 1024).toFixed(1)}KB` : "done");
+		}
+	} else if (toolName === "grep") {
+		const pat = truncateToWidth(String(args?.pattern ?? ""), 36, "…");
+		const p = args?.path ? ` ${fg("dim", shortenPath(String(args.path)))}` : "";
+		callDesc = `${fg("accent", "🔍")} ${fg("toolTitle", bold("grep"))} ${fg("accent", `"${pat}"`)}${p}`;
+		if (isPartial) {
+			resultDesc = `${breatheText("Searching", COLOR_CYAN, COLOR_PURPLE, 3.6)} ${renderBreathingWave(COLOR_CYAN, COLOR_PURPLE, ["•", "•", "•"])}`;
+		} else if (isError) {
+			resultDesc = fg("error", "Failed");
+		} else {
+			const out = extractText(result).trim();
+			const lines = out ? out.split("\n") : [];
+			resultDesc = fg("muted", out === "No matches found" ? "0 matches" : `${lines.length} lines`);
+		}
+	} else if (toolName === "find" || toolName === "ls") {
+		const pat = args?.pattern ? `"${truncateToWidth(String(args.pattern), 32, "…")}"` : "";
+		const p = args?.path ? shortenPath(String(args.path)) : ".";
+		callDesc = `${fg("accent", "📂")} ${fg("toolTitle", bold(toolName))} ${fg("accent", pat || p)}`;
+		if (isPartial) {
+			resultDesc = `${breatheText("Scanning", COLOR_CYAN, COLOR_PURPLE, 3.6)} ${renderBreathingWave(COLOR_CYAN, COLOR_PURPLE, ["•", "•", "•"])}`;
+		} else if (isError) {
+			resultDesc = fg("error", "Failed");
+		} else {
+			const out = extractText(result).trim();
+			const lines = out ? out.split("\n") : [];
+			resultDesc = fg("muted", `${lines.length} items`);
+		}
+	} else if (toolName === "codemode") {
+		callDesc = `${fg("warning", "⚡")} ${fg("toolTitle", bold("codemode"))} ${fg("dim", "JS sandbox")}`;
+		if (isPartial) {
+			resultDesc = `${breatheText("Executing script", COLOR_AMBER, COLOR_CYAN, 3.6)} ${renderBreathingWave(COLOR_AMBER, COLOR_CYAN, ["•", "•", "•"])}`;
+		} else if (isError) {
+			resultDesc = fg("error", "Script failed");
+		} else {
+			const out = extractText(result).trim();
+			const lines = out ? out.split("\n") : [];
+			resultDesc = fg("muted", `${lines.length} lines`);
+		}
 	} else {
 		const argPreview =
 			args?.path
