@@ -1,0 +1,24 @@
+{
+  "name": "pi-pretty-config",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Claude Code-style UI, Truecolor RGB breathing animations, hover highlights, rich Markdown, 2-line telemetry footer, persistent memory, subagents, and custom themes for Pi Coding Agent.",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "claude-code-ui",
+    "tokyo-night",
+    "catppuccin"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "themes": [
+      "./themes"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "$schema": "https://pi.dev/schemas/settings.schema.json",
+  "theme": "catppuccin-latte/tokyo-night"
+}
