@@ -1727,16 +1727,18 @@ export default function prettyUiExtension(pi: ExtensionAPI) {
 		stopAnimTimerIfIdle();
 	});
 
-	// Detect & strip mid-stream upstream retries from local proxies (e.g. magpie / 127.0.0.1:3425)
+	// Detect & strip mid-stream upstream retries / continuations from local proxies (e.g. magpie / 127.0.0.1:3425)
 	let activeStreamContent: any[] | undefined;
 	let activeStreamChunkId: string | undefined;
 	let hasStreamedTextInTurn = false;
+	let lastTextDeltaAt = 0;
 
 	pi.on("message_start", async (event: any) => {
 		if (event?.message?.role === "assistant" && Array.isArray(event.message.content)) {
 			activeStreamContent = event.message.content;
 			activeStreamChunkId = undefined;
 			hasStreamedTextInTurn = false;
+			lastTextDeltaAt = 0;
 		}
 	});
 
@@ -1744,20 +1746,32 @@ export default function prettyUiExtension(pi: ExtensionAPI) {
 		const chunk = event?.data;
 		if (!chunk || typeof chunk !== "object" || !Array.isArray(activeStreamContent)) return;
 
+		const now = Date.now();
 		const chunkId = typeof chunk.id === "string" && chunk.id.length > 0 ? chunk.id : undefined;
 		const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
 		const delta = choice?.delta;
+		const hasContentDelta = typeof delta?.content === "string" && delta.content.length > 0;
 
 		const idChangedMidStream = Boolean(chunkId && activeStreamChunkId && chunkId !== activeStreamChunkId);
 		const roleRestartedMidStream = Boolean(hasStreamedTextInTurn && delta?.role === "assistant");
 		const reasoningRestartedAfterText = Boolean(
 			hasStreamedTextInTurn &&
-				(typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0 ||
-					typeof delta?.reasoning === "string" && delta.reasoning.length > 0 ||
-					typeof delta?.reasoning_text === "string" && delta.reasoning_text.length > 0),
+				((typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0) ||
+					(typeof delta?.reasoning === "string" && delta.reasoning.length > 0) ||
+					(typeof delta?.reasoning_text === "string" && delta.reasoning_text.length > 0)),
+		);
+		// magpie's (*Server).streamTranslated + (*continuation).again aborts after 1.0s idle and starts a new
+		// upstream Gemini request (whose hidden thinking phase takes 3.5s–20s), reusing the same chunk.id.
+		const continuationRestartAfterSilence = Boolean(
+			hasStreamedTextInTurn && hasContentDelta && lastTextDeltaAt > 0 && now - lastTextDeltaAt > 2200,
 		);
 
-		if (idChangedMidStream || roleRestartedMidStream || reasoningRestartedAfterText) {
+		if (
+			idChangedMidStream ||
+			roleRestartedMidStream ||
+			reasoningRestartedAfterText ||
+			continuationRestartAfterSilence
+		) {
 			for (const block of activeStreamContent) {
 				if (block && block.type === "text") {
 					block.text = "";
@@ -1771,8 +1785,14 @@ export default function prettyUiExtension(pi: ExtensionAPI) {
 			}
 			activeStreamChunkId = chunkId;
 			hasStreamedTextInTurn = false;
+			lastTextDeltaAt = 0;
 		} else if (chunkId && !activeStreamChunkId) {
 			activeStreamChunkId = chunkId;
+		}
+
+		if (hasContentDelta) {
+			hasStreamedTextInTurn = true;
+			lastTextDeltaAt = now;
 		}
 
 		// Also guard against a tool_call retry at the same streamIndex with a new toolCall.id
@@ -1796,16 +1816,13 @@ export default function prettyUiExtension(pi: ExtensionAPI) {
 				}
 			}
 		}
-
-		if (typeof delta?.content === "string" && delta.content.length > 0) {
-			hasStreamedTextInTurn = true;
-		}
 	});
 
 	pi.on("message_end", async () => {
 		activeStreamContent = undefined;
 		activeStreamChunkId = undefined;
 		hasStreamedTextInTurn = false;
+		lastTextDeltaAt = 0;
 	});
 
 	pi.on("session_shutdown", async () => {
