@@ -48,6 +48,8 @@ import {
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 
+import { fuzzyFilter, Input, SelectList, truncateToWidth } from "@earendil-works/pi-tui";
+
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 interface CompactionModelConfig {
@@ -650,7 +652,53 @@ export default function compactionModelExtension(pi: ExtensionAPI): void {
 				}),
 			];
 
-			const choice = await ctx.ui.select(`选择上下文压缩模型 (${currentDesc})`, options);
+			const title = `选择上下文压缩模型 (${currentDesc})`;
+			const choice = ctx.mode === "tui"
+				? await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+					const search = new Input({ prompt: "搜索: ", placeholder: "模型名称或提供商" });
+					const items = options.map((label) => ({ value: label, label }));
+					let filtered = items;
+					let selectedIndex = 0;
+					let list: SelectList | undefined;
+					return {
+						get focused() { return search.focused; },
+						set focused(value: boolean) { search.focused = value; },
+						render(width: number) {
+							// Reserve room for the title, search, hints, and scroll indicator.
+							const visibleRows = Math.max(1, Math.min(10, tui.terminal.rows - 8));
+							list = new SelectList(filtered, visibleRows, {
+								selectedPrefix: (text) => theme.fg("accent", text),
+								selectedText: (text) => theme.fg("accent", text),
+								description: (text) => theme.fg("muted", text),
+								scrollInfo: (text) => theme.fg("dim", text),
+								noMatch: () => theme.fg("muted", "  没有匹配的模型"),
+							});
+							list.setSelectedIndex(selectedIndex);
+							list.onSelectionChange = (item) => { selectedIndex = filtered.indexOf(item); };
+							list.onSelect = (item) => done(item.value);
+							list.onCancel = () => done(undefined);
+							return [
+								truncateToWidth(theme.fg("accent", title), width),
+								...search.render(width),
+								...list.render(width),
+								truncateToWidth(theme.fg("dim", "输入筛选 · ↑↓ 选择 · Enter 确认 · Esc 取消"), width),
+							];
+						},
+						handleInput(data: string) {
+							if ((["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const)
+								.some((action) => keybindings.matches(data, action))) {
+								list?.handleInput(data);
+							} else {
+								search.handleInput(data);
+								filtered = fuzzyFilter(items, search.getValue(), (item) => item.label);
+								selectedIndex = 0;
+							}
+							tui.requestRender();
+						},
+						invalidate() { search.invalidate(); list?.invalidate(); },
+					};
+				})
+				: await ctx.ui.select(title, options);
 			if (!choice) return;
 
 			if (choice === FOLLOW_DEFAULT_OPTION) {
