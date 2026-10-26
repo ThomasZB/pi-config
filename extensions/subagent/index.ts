@@ -19,7 +19,8 @@ import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
-import {\n\tCONFIG_DIR_NAME,
+import {
+	CONFIG_DIR_NAME,
 	type ExtensionAPI,
 	type ExtensionContext,
 	formatReadLineRange,
