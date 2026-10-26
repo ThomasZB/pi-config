@@ -22,11 +22,13 @@
  *      bloat is below `clearAtLeastTokens` (default 30,000 tokens), ZERO historical messages are
  *      modified — preserving 100% prefix cache hits.
  *    - When the user returns after an idle gap >= `cacheTtlMinutes` (default 6 min, when the 5-min
- *      server-side prompt cache has already expired anyway) OR when old tool outputs (> 4 turns ago)
+ *      server-side prompt cache has already expired anyway) OR when old tool outputs
  *      accumulate >= `clearAtLeastTokens`, large old tool outputs (`bash`, `read`, `grep`, `codemode`,
- *      `web_fetch`, etc.) are batch-compacted into `[Head 10 lines + Tail 8 lines + #seq recall ref]`
- *      and persisted via Pi's native append-only `context_edit` entries.
- *    - Full original tool outputs remain 100% intact in `.jsonl` and retrievable via `session_recall`!
+ *      `web_fetch`, old images, etc.) older than `keepRecentToolSteps` (default 6 steps) are
+ *      batch-compacted into `[Head 10 lines + Tail 8 lines + #seq recall ref]`.
+ *    - Persisted via a `custom` session entry (`session_recall_microcompact`) and applied in `context`
+ *      BEFORE the LLM request so `assistant.usage.totalTokens` in the footer always reflects the true
+ *      API token count (without triggering Pi's `context_edit` `chars/4` estimator fallback glitch).
  *
  * Commands:
  * - `/recall` or `/recall status`  Show recall & micro-compaction status and saved tokens
@@ -39,7 +41,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-	type ContextEditEntryDraft,
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
@@ -61,7 +62,7 @@ interface IndexedEntry {
 	compacted: boolean;
 	/** Tool name if assistant toolCall or toolResult */
 	toolName?: string;
-	/** Full extracted plain text (always raw, ignoring `context_edit`) */
+	/** Full extracted plain text (always raw, ignoring micro-compaction) */
 	text: string;
 	lineCount: number;
 	charCount: number;
@@ -100,9 +101,12 @@ export interface MicroCompactionConfig {
 	 * server cache has already expired and will be rewritten anyway — making cleanup 100% free!
 	 */
 	cacheTtlMinutes: number;
-	/** Number of most recent user turns whose tool outputs are always kept intact (default: 4) */
-	keepRecentTurns: number;
-	/** Minimum character length of a single toolResult to be eligible for micro-compaction (default: 4000) */
+	/**
+	 * Number of most recent assistant/tool steps whose tool outputs are always kept intact (default: 6).
+	 * Much more accurate than counting user messages when a single user prompt triggers 20+ tool calls.
+	 */
+	keepRecentToolSteps: number;
+	/** Minimum character length of a single toolResult to be eligible for micro-compaction (default: 3000) */
 	minToolResultChars: number;
 	/**
 	 * Minimum estimated tokens to clear when triggering while cache is still hot (default: 30000).
@@ -111,29 +115,34 @@ export interface MicroCompactionConfig {
 	clearAtLeastTokens: number;
 }
 
-interface PendingMicroEdit {
+interface PinnedMicroEdit {
 	entryId: string;
 	toolCallId: string;
 	toolName: string;
 	seq: number;
-	originalChars: number;
+	savedChars: number;
 	replacementText: string;
-	committed: boolean;
+}
+
+interface PersistedMicroCompactData {
+	edits: PinnedMicroEdit[];
 }
 
 const DEFAULT_MC_CONFIG: MicroCompactionConfig = {
 	enabled: true,
 	cacheTtlMinutes: 6,
-	keepRecentTurns: 4,
-	minToolResultChars: 4000,
+	keepRecentToolSteps: 6,
+	minToolResultChars: 3000,
 	clearAtLeastTokens: 30000,
 };
 
+const CUSTOM_MICROCOMPACT_TYPE = "session_recall_microcompact";
 const MAX_READ_CHARS_DEFAULT = 8000;
 const MAX_READ_CHARS_LIMIT = 24000;
 const HEAD_KEEP_LINES = 10;
 const TAIL_KEEP_LINES = 8;
 const MICRO_COMPACTED_SENTINEL = "[Micro-compacted toolResult";
+const ESTIMATED_IMAGE_TOKENS = 2000;
 
 /**
  * Memoized system prompt appendix keyed by `${sessionId}:${latestCompactionId ?? "none"}`.
@@ -143,12 +152,11 @@ const promptAppendixCache = new Map<string, string>();
 
 /**
  * Pinned micro-compaction edits for the active session, keyed by `toolCallId`.
- * Once an edit is triggered (after cache TTL expiry or threshold), it is applied in `context`
- * immediately for the current turn AND committed as a permanent `context_edit` entry at `agent_before_settle`.
+ * Once an edit is triggered (after cache TTL expiry or threshold), it is persisted in a
+ * `custom` entry (`session_recall_microcompact`) and applied deterministically in `pi.on("context")`.
  */
-const pinnedEditsByCallId = new Map<string, PendingMicroEdit>();
-let totalSavedCharsInSession = 0;
-let totalClearedCountInSession = 0;
+const pinnedEditsByCallId = new Map<string, PinnedMicroEdit>();
+let hydratedSessionKey = "";
 
 function readSettingsFile(filePath: string): Record<string, any> | undefined {
 	if (!fs.existsSync(filePath)) return undefined;
@@ -206,12 +214,12 @@ function resolveMicroCompactionConfig(cwd: string): MicroCompactionConfig {
 		(typeof gMc.cacheTtlMinutes === "number" ? gMc.cacheTtlMinutes : undefined) ??
 		DEFAULT_MC_CONFIG.cacheTtlMinutes;
 
-	const keepRecentTurns =
-		typeof pMc.keepRecentTurns === "number"
-			? pMc.keepRecentTurns
-			: typeof gMc.keepRecentTurns === "number"
-				? gMc.keepRecentTurns
-				: DEFAULT_MC_CONFIG.keepRecentTurns;
+	const keepRecentToolSteps =
+		typeof pMc.keepRecentToolSteps === "number"
+			? pMc.keepRecentToolSteps
+			: typeof gMc.keepRecentToolSteps === "number"
+				? gMc.keepRecentToolSteps
+				: DEFAULT_MC_CONFIG.keepRecentToolSteps;
 
 	const minToolResultChars =
 		typeof pMc.minToolResultChars === "number"
@@ -230,7 +238,7 @@ function resolveMicroCompactionConfig(cwd: string): MicroCompactionConfig {
 	return {
 		enabled,
 		cacheTtlMinutes: Math.max(0, rawTtl),
-		keepRecentTurns: Math.max(1, keepRecentTurns),
+		keepRecentToolSteps: Math.max(2, keepRecentToolSteps),
 		minToolResultChars: Math.max(1000, minToolResultChars),
 		clearAtLeastTokens: Math.max(2000, clearAtLeastTokens),
 	};
@@ -277,6 +285,8 @@ function extractEntryContent(entry: SessionEntry): {
 				if (!block || typeof block !== "object") continue;
 				if (block.type === "text" && typeof block.text === "string") {
 					parts.push(block.text);
+				} else if (block.type === "image") {
+					parts.push(`[image: ${block.mimeType ?? "image"}]`);
 				} else if (block.type === "toolCall") {
 					const name = block.name ?? "tool";
 					if (name === "session_recall") continue;
@@ -336,16 +346,66 @@ function extractEntryContent(entry: SessionEntry): {
 	return { role: entry.type, text: "" };
 }
 
+/**
+ * Restore any persisted micro-compaction edits from the current session branch so
+ * resumed sessions or post-reload sessions keep the exact same pinned edits.
+ */
+function ensureHydratedFromBranch(branch: SessionEntry[], sessionId: string): void {
+	let latestCompactionId = "none";
+	for (const e of branch) {
+		if (e.type === "compaction") {
+			latestCompactionId = e.id;
+		}
+	}
+	const key = `${sessionId}:${latestCompactionId}`;
+	if (hydratedSessionKey === key) return;
+	hydratedSessionKey = key;
+	pinnedEditsByCallId.clear();
+
+	let startIdx = 0;
+	for (let i = 0; i < branch.length; i++) {
+		const e = branch[i]!;
+		if (e.type === "compaction") {
+			startIdx = i + 1;
+			const firstKeptId = (e as any).firstKeptEntryId;
+			if (firstKeptId) {
+				const found = branch.findIndex((b, idx) => idx <= i && b.id === firstKeptId);
+				if (found >= 0) startIdx = found;
+			}
+		}
+	}
+
+	for (let i = startIdx; i < branch.length; i++) {
+		const e = branch[i]!;
+		if (e.type === "custom" && (e as any).customType === CUSTOM_MICROCOMPACT_TYPE) {
+			const data = (e as any).data as PersistedMicroCompactData | undefined;
+			if (data && Array.isArray(data.edits)) {
+				for (const edit of data.edits) {
+					if (edit && typeof edit.toolCallId === "string" && typeof edit.replacementText === "string") {
+						pinnedEditsByCallId.set(edit.toolCallId, edit);
+					}
+				}
+			}
+		}
+	}
+}
+
 function indexBranchEntries(
 	branch: SessionEntry[],
 	sessionId: string,
 	sessionFile?: string,
 ): ParsedBranchInfo {
+	ensureHydratedFromBranch(branch, sessionId);
+
 	let latestCompactionIdx = -1;
 	let latestCompactionId: string | undefined;
 	let compactionCount = 0;
 	let firstKeptEntryId: string | undefined;
 	const microCompactedIds = new Set<string>();
+
+	for (const edit of pinnedEditsByCallId.values()) {
+		microCompactedIds.add(edit.entryId);
+	}
 
 	for (let i = 0; i < branch.length; i++) {
 		const e = branch[i]!;
@@ -442,12 +502,23 @@ function buildMicroCompactedText(
 	entryId: string,
 	toolName: string,
 	rawText: string,
+	hasImage: boolean,
 ): string {
+	if (hasImage && rawText.length < 1500) {
+		return [
+			`${MICRO_COMPACTED_SENTINEL}(${toolName}) — #${seq} (id:${entryId}, image + ${rawText.length} chars). Base64 image payload was micro-compacted after cache expiry to save context; re-read the image file if you need to inspect it again.]`,
+			rawText ? `--- Note ---\n${rawText}` : "",
+		]
+			.filter(Boolean)
+			.join("\n");
+	}
+
 	const lines = rawText.split(/\r?\n/);
 	const totalLines = lines.length;
 	const totalChars = rawText.length;
+	const imgNote = hasImage ? " + image" : "";
 
-	const header = `${MICRO_COMPACTED_SENTINEL}(${toolName}) — #${seq} (id:${entryId}, ${totalLines} lines, ${totalChars.toLocaleString()} chars). Full verbatim output is preserved; call session_recall({ action: "read", seq: ${seq} }) if you need the omitted middle content.]`;
+	const header = `${MICRO_COMPACTED_SENTINEL}(${toolName}) — #${seq} (id:${entryId}, ${totalLines} lines, ${totalChars.toLocaleString()} chars${imgNote}). Full verbatim output is preserved; call session_recall({ action: "read", seq: ${seq} }) if you need the omitted middle content.]`;
 
 	if (totalLines <= HEAD_KEEP_LINES + TAIL_KEEP_LINES + 4) {
 		const headSlice = rawText.slice(0, 900);
@@ -483,15 +554,23 @@ function buildMicroCompactedText(
  * Triggers ONLY when:
  * 1. `force === true` (user ran `/recall compact`), OR
  * 2. Idle time since last assistant message >= `config.cacheTtlMinutes` (server cache expired anyway -> FREE cleanup!), OR
- * 3. Total savable tokens in old turns (>= `keepRecentTurns` ago) >= `config.clearAtLeastTokens`.
+ * 3. Total savable tokens in old tool steps (>= `keepRecentToolSteps` ago) >= `config.clearAtLeastTokens`.
  */
 function evaluateAndStageMicroCompaction(
+	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	config: MicroCompactionConfig,
 	force = false,
-): { triggered: boolean; reason?: string; count: number; savedChars: number; gapMinutes: number } {
+): {
+	triggered: boolean;
+	reason?: string;
+	count: number;
+	savedChars: number;
+	savedTokensApprox: number;
+	gapMinutes: number;
+} {
 	if (!config.enabled && !force) {
-		return { triggered: false, count: 0, savedChars: 0, gapMinutes: 0 };
+		return { triggered: false, count: 0, savedChars: 0, savedTokensApprox: 0, gapMinutes: 0 };
 	}
 
 	const branch = ctx.sessionManager.getBranch();
@@ -533,27 +612,26 @@ function evaluateAndStageMicroCompaction(
 	const gapMinutes =
 		lastAssistantTimestampMs > 0 ? (Date.now() - lastAssistantTimestampMs) / 60000 : 0;
 
-	// Count how many user turns occur AFTER each branch index
-	const userTurnsAfter = new Array<number>(branch.length).fill(0);
-	let seenUserTurns = 0;
+	// Count how many assistant steps occur AFTER each branch index.
+	// Using assistant/tool steps (rather than user messages) ensures that a single user turn
+	// with 25+ tool calls still cleans up steps 1..19 once they are >= keepRecentToolSteps behind!
+	const assistantStepsAfter = new Array<number>(branch.length).fill(0);
+	let seenAssistantSteps = 0;
 	for (let i = branch.length - 1; i >= startIdx; i--) {
-		userTurnsAfter[i] = seenUserTurns;
+		assistantStepsAfter[i] = seenAssistantSteps;
 		const e = branch[i]!;
-		if (e.type === "message" && (e as any).message?.role === "user") {
-			seenUserTurns++;
+		if (e.type === "message" && (e as any).message?.role === "assistant") {
+			seenAssistantSteps++;
 		}
 	}
 
-	// Collect eligible old oversized toolResult entries not yet micro-compacted
-	const candidates: PendingMicroEdit[] = [];
+	const minStepsToKeep = force ? 2 : config.keepRecentToolSteps;
+	const candidates: PinnedMicroEdit[] = [];
 	let totalSavableChars = 0;
+	let totalSavableImageTokens = 0;
 
 	for (let i = startIdx; i < branch.length; i++) {
-		if (!force && userTurnsAfter[i]! < config.keepRecentTurns) {
-			continue;
-		}
-		// Even in force mode, keep at least the very last user turn's tool outputs intact
-		if (force && userTurnsAfter[i]! < 1) {
+		if (assistantStepsAfter[i]! < minStepsToKeep) {
 			continue;
 		}
 
@@ -567,7 +645,6 @@ function evaluateAndStageMicroCompaction(
 		const toolName = String(msg.toolName ?? "tool");
 		if (!toolCallId || pinnedEditsByCallId.has(toolCallId)) continue;
 
-		// Skip memory/todo tools which are small and structural
 		if (toolName === "memory" || toolName === "todo") continue;
 
 		const rawText = Array.isArray(msg.content)
@@ -579,44 +656,58 @@ function evaluateAndStageMicroCompaction(
 				? msg.content
 				: "";
 
+		const hasImage =
+			Array.isArray(msg.content) && msg.content.some((c: any) => c?.type === "image");
+
 		if (rawText.startsWith(MICRO_COMPACTED_SENTINEL)) continue;
-		if (rawText.length < config.minToolResultChars) continue;
+		if (!hasImage && rawText.length < config.minToolResultChars) continue;
 
 		const seq = seqById.get(e.id) ?? i + 1;
-		const replacementText = buildMicroCompactedText(seq, e.id, toolName, rawText);
+		const replacementText = buildMicroCompactedText(seq, e.id, toolName, rawText, hasImage);
 		const savedChars = Math.max(0, rawText.length - replacementText.length);
-		if (savedChars < 1000) continue;
+		if (!hasImage && savedChars < 800) continue;
 
 		candidates.push({
 			entryId: e.id,
 			toolCallId,
 			toolName,
 			seq,
-			originalChars: rawText.length,
+			savedChars,
 			replacementText,
-			committed: false,
 		});
 		totalSavableChars += savedChars;
+		if (hasImage) {
+			totalSavableImageTokens += ESTIMATED_IMAGE_TOKENS;
+		}
 	}
 
 	if (candidates.length === 0) {
-		return { triggered: false, count: 0, savedChars: 0, gapMinutes };
+		return { triggered: false, count: 0, savedChars: 0, savedTokensApprox: 0, gapMinutes };
 	}
 
-	const estimatedSavableTokens = Math.round(totalSavableChars / 4);
+	// Code/JSON/CJK averages ~3.2 chars per token in real BPE tokenizers
+	const estimatedSavableTokens =
+		Math.round(totalSavableChars / 3.2) + totalSavableImageTokens;
 	const cacheExpiredTrigger =
 		config.cacheTtlMinutes > 0 && gapMinutes >= config.cacheTtlMinutes;
 	const thresholdTrigger = estimatedSavableTokens >= config.clearAtLeastTokens;
 
 	if (!force && !cacheExpiredTrigger && !thresholdTrigger) {
-		return { triggered: false, count: 0, savedChars: 0, gapMinutes };
+		return { triggered: false, count: 0, savedChars: 0, savedTokensApprox: 0, gapMinutes };
 	}
 
 	for (const c of candidates) {
 		pinnedEditsByCallId.set(c.toolCallId, c);
 	}
-	totalSavedCharsInSession += totalSavableChars;
-	totalClearedCountInSession += candidates.length;
+
+	// Persist in a `custom` entry (`session_recall_microcompact`) so:
+	// 1. It survives `/reload` and `--continue` / `/resume`
+	// 2. Unlike `context_edit` appended at `agent_before_settle`, a `custom` entry does NOT
+	//    invalidate `usageEntryIndex` in Pi's `estimateProjectedContextTokens()`, so the footer
+	//    ALWAYS displays the real LLM API `usage.totalTokens` without jumping to `chars/4` (100k) and back!
+	pi.appendEntry<PersistedMicroCompactData>(CUSTOM_MICROCOMPACT_TYPE, {
+		edits: candidates,
+	});
 
 	const reason = force
 		? "manual"
@@ -629,6 +720,7 @@ function evaluateAndStageMicroCompaction(
 		reason,
 		count: candidates.length,
 		savedChars: totalSavableChars,
+		savedTokensApprox: estimatedSavableTokens,
 		gapMinutes,
 	};
 }
@@ -798,16 +890,10 @@ function formatRoleLabel(entry: IndexedEntry): string {
 	return entry.role;
 }
 
-/**
- * Static timestamp formatter (used in System Prompt so strings never tick and invalidate cache).
- */
 function formatStaticTime(date: Date): string {
 	return date.toISOString().slice(0, 16).replace("T", " ");
 }
 
-/**
- * Relative time formatter (used only in interactive `/recall` notifications or `list_sessions` tool output).
- */
 function formatRelativeTime(date: Date): string {
 	const diffMs = Date.now() - date.getTime();
 	const diffMin = Math.max(0, Math.floor(diffMs / 60000));
@@ -1083,7 +1169,6 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 					regex = new RegExp(escaped, "i");
 				}
 
-				// Cross-session project search
 				if (params.scope === "project" && !params.session_id) {
 					const currentInfo = getCurrentSessionBranchInfo(ctx);
 					const recentSessions = listRecentProjectSessions(ctx, 20, true);
@@ -1126,7 +1211,6 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 					};
 				}
 
-				// Single-session search (current or specified session_id)
 				const target = loadTargetSessionBranch(ctx, params.session_id);
 				if (target.error || !target.info) {
 					return {
@@ -1286,10 +1370,14 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// 2. Apply pinned micro-compaction edits in `context` (for the immediate turn when triggered,
-	//    before `agent_before_settle` commits them as native `context_edit` entries).
-	pi.on("context", async (event) => {
+	// 2. Apply pinned micro-compaction edits in `context` BEFORE the LLM request is sent.
+	//    Because these edits are applied before the LLM call (and persisted via a `custom` entry
+	//    rather than a post-turn `context_edit`), the LLM's `assistant.usage.totalTokens` in the
+	//    footer is always the 100% accurate real API token count and never bounces!
+	pi.on("context", async (event, ctx) => {
+		ensureHydratedFromBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId());
 		if (pinnedEditsByCallId.size === 0) return;
+
 		const messages = event.messages;
 		if (!Array.isArray(messages) || messages.length === 0) return;
 
@@ -1303,7 +1391,8 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 			const currentText = Array.isArray(m.content)
 				? m.content.find((c: any) => c?.type === "text")?.text ?? ""
 				: "";
-			if (currentText.startsWith(MICRO_COMPACTED_SENTINEL)) {
+			const hasImg = Array.isArray(m.content) && m.content.some((c: any) => c?.type === "image");
+			if (currentText.startsWith(MICRO_COMPACTED_SENTINEL) && !hasImg) {
 				return msg;
 			}
 
@@ -1318,37 +1407,15 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 		return { messages: nextMessages };
 	});
 
-	// 3. Persist uncommitted micro-compaction edits as native Pi `context_edit` entries at turn settlement
-	//    so Pi's token counter (`CTX ▰▰▱▱`) and session file permanently reflect the smaller context!
-	pi.on("agent_before_settle", async () => {
-		const drafts: ContextEditEntryDraft[] = [];
-		for (const edit of pinnedEditsByCallId.values()) {
-			if (!edit.committed) {
-				edit.committed = true;
-				drafts.push({
-					type: "context_edit",
-					targetId: edit.entryId,
-					replacement: {
-						content: [{ type: "text", text: edit.replacementText }],
-					},
-				});
-			}
-		}
-		if (drafts.length === 0) return;
-		return { entries: drafts };
-	});
-
-	// 4. Prompt-Cache Safe `before_agent_start`:
+	// 3. Prompt-Cache Safe `before_agent_start`:
 	//    - Evaluates Cache-Aware Micro-Compaction (Time-Based >= cacheTtlMinutes OR Threshold >= clearAtLeastTokens)
 	//    - Injects memoized `<compacted_history_recall>` and `<project_session_continuity>` into systemPrompt
 	pi.on("before_agent_start", async (event, ctx) => {
-		// Step A: Evaluate Cache-Aware Micro-Compaction before the turn starts
 		const mcConfig = resolveMicroCompactionConfig(ctx.cwd);
-		const mcResult = evaluateAndStageMicroCompaction(ctx, mcConfig, false);
+		const mcResult = evaluateAndStageMicroCompaction(pi, ctx, mcConfig, false);
 		if (mcResult.triggered) {
-			const approxTokens = Math.round(mcResult.savedChars / 4);
 			ctx.ui.notify(
-				`🧹 已自动微压缩 ${mcResult.count} 条旧工具输出 (节省 ~${approxTokens.toLocaleString()} tokens，触发原因: ${mcResult.reason}，原文可通过 session_recall 无损查阅)`,
+				`🧹 已自动微压缩 ${mcResult.count} 条旧工具输出 (预计节省 ~${mcResult.savedTokensApprox.toLocaleString()} tokens，触发原因: ${mcResult.reason}，原文可通过 session_recall 无损查阅)`,
 				"info",
 			);
 		}
@@ -1414,15 +1481,15 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", async () => {
 		promptAppendixCache.clear();
 		pinnedEditsByCallId.clear();
+		hydratedSessionKey = "";
 	});
 	pi.on("session_start", async () => {
 		promptAppendixCache.clear();
 		pinnedEditsByCallId.clear();
-		totalSavedCharsInSession = 0;
-		totalClearedCountInSession = 0;
+		hydratedSessionKey = "";
 	});
 
-	// 5. Register `/recall` command for status, custom TTL configuration, and manual micro-compaction
+	// 4. Register `/recall` command for status, custom TTL configuration, and manual micro-compaction
 	pi.registerCommand("recall", {
 		description:
 			"查看历史回溯与微压缩状态，或设置缓存过期微压缩时间 (/recall [status | ttl <分钟> | compact | on | off])",
@@ -1432,7 +1499,7 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 				{ value: "ttl 6", label: "ttl 6 — 设置空闲 6 分钟（缓存过期后）自动微压缩旧工具输出 (默认)" },
 				{ value: "ttl 10", label: "ttl 10 — 设置空闲 10 分钟自动微压缩旧工具输出" },
 				{ value: "ttl 30", label: "ttl 30 — 设置空闲 30 分钟自动微压缩旧工具输出" },
-				{ value: "compact", label: "compact — 立即手动微压缩 4 轮以前的超大工具输出" },
+				{ value: "compact", label: "compact — 立即手动微压缩早期超大工具输出" },
 				{ value: "on", label: "on — 开启自动缓存感知微压缩" },
 				{ value: "off", label: "off — 关闭自动缓存感知微压缩" },
 			];
@@ -1488,13 +1555,12 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 
 			// `/recall compact`
 			if (raw.toLowerCase() === "compact") {
-				const res = evaluateAndStageMicroCompaction(ctx, config, true);
+				const res = evaluateAndStageMicroCompaction(pi, ctx, config, true);
 				if (!res.triggered) {
 					ctx.ui.notify("当前没有需要微压缩的超大旧工具输出（上下文已处于精简状态）", "info");
 				} else {
-					const approxTokens = Math.round(res.savedChars / 4);
 					ctx.ui.notify(
-						`🧹 已手动微压缩 ${res.count} 条旧工具输出，预计释放 ~${approxTokens.toLocaleString()} tokens（下一轮生效并写入 context_edit，原文仍可通过 session_recall 查阅）`,
+						`🧹 已手动微压缩 ${res.count} 条旧工具输出，预计释放 ~${res.savedTokensApprox.toLocaleString()} tokens（下一轮请求自动生效，原文仍可通过 session_recall 查阅）`,
 						"info",
 					);
 				}
@@ -1504,15 +1570,19 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 			// Default: `/recall` or `/recall status`
 			const current = getCurrentSessionBranchInfo(ctx);
 			const recent = listRecentProjectSessions(ctx, 5, true);
-			const totalMicroCount = current.microCompactedIds.size + Array.from(pinnedEditsByCallId.values()).filter((e) => !e.committed).length;
-			const approxSavedTokens = Math.round(totalSavedCharsInSession / 4);
+			const totalMicroCount = current.microCompactedIds.size;
+			let savedCharsSum = 0;
+			for (const edit of pinnedEditsByCallId.values()) {
+				savedCharsSum += edit.savedChars;
+			}
+			const approxSavedTokens = Math.round(savedCharsSum / 3.2);
 
 			const compactMsg =
 				current.compactedEntries.length > 0
 					? `已压缩归档: ${current.compactedEntries.length} 条 (#1..#${current.compactedEntries[current.compactedEntries.length - 1]!.seq})`
 					: `会话记录: ${current.entries.length} 条 (未触发全量压缩)`;
 
-			const mcMsg = `微压缩: ${config.enabled ? `开启 (TTL=${config.cacheTtlMinutes}min, 阈值=${(config.clearAtLeastTokens / 1000).toFixed(0)}k)` : "关闭"} · 已瘦身 ${totalMicroCount} 条旧工具输出${approxSavedTokens > 0 ? ` (~${approxSavedTokens.toLocaleString()} tokens)` : ""}`;
+			const mcMsg = `微压缩: ${config.enabled ? `开启 (TTL=${config.cacheTtlMinutes}min, 步距=${config.keepRecentToolSteps}, 阈值=${(config.clearAtLeastTokens / 1000).toFixed(0)}k)` : "关闭"} · 已瘦身 ${totalMicroCount} 条旧工具输出${approxSavedTokens > 0 ? ` (~${approxSavedTokens.toLocaleString()} tokens)` : ""}`;
 
 			const recentMsg =
 				recent.length > 0

@@ -8,8 +8,8 @@
   "microCompaction": {
     "enabled": true,
     "cacheTtlMinutes": 6,
-    "keepRecentTurns": 4,
-    "minToolResultChars": 4000,
+    "keepRecentToolSteps": 6,
+    "minToolResultChars": 3000,
     "clearAtLeastTokens": 30000
   }
 }
