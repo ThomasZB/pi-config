@@ -21,12 +21,15 @@
  *    - Intermediate thinking before tool calls: automatically folds away (0 lines) once tool execution starts
  *    - Final answer thinking: collapses into a single clickable line (`▸ 💭 已思考 (N 行)`), lights up on mouse hover!
  *
- * 4. Claude-Style Consecutive Command Grouping + Breathing Light & Hover:
- *    - Single command: 1-line summary when done, lights up on hover (`▶ ... [ ✦ 点击展开输出 ]`)
- *    - Consecutive commands (2+ tools in a row):
+ * 4. Claude-Style Consecutive Command Grouping + Standalone File Change Cards:
+ *    - Read/search/bash commands (2+ in a row):
  *      - Running: RGB breathing progress bar `▰▰▱` + live elapsed timer + currently executing command
  *      - Done: 2-line summary card, lights up on mouse hover (`▶ ... [ ✦ 点击展开全部 N 步历史 ]`)
  *      - Expanded history: each step row individually highlights when hovered (`├─ 2. ▶ ... [ ✦ 点击查看详情 ]`)!
+ *    - File modifications (`edit`, `write`, or `codemode` with file edits):
+ *      - Always broken out as standalone cards in the chat stream (never buried inside a collapsed command group)
+ *      - Default view shows a balanced compact diff/content thumbnail (up to 8 lines with 1-line context & stats)
+ *      - Click (or Ctrl+O) toggles between the compact thumbnail and the full diff/content view!
  */
 
 import { homedir } from "node:os";
@@ -803,7 +806,71 @@ const ORIG_TOOL_MOUSE_KEY = Symbol.for("pretty-ui:origToolMouse");
 const ORIG_TOOL_SET_EXPANDED_KEY = Symbol.for("pretty-ui:origToolSetExpanded");
 const ORIG_TOOL_MARK_START_KEY = Symbol.for("pretty-ui:origToolMarkStart");
 
+const EDIT_THUMBNAIL_MAX_LINES = 8;
+const EDIT_EXPANDED_MAX_LINES = 100;
+const WRITE_THUMBNAIL_MAX_LINES = 6;
+const WRITE_EXPANDED_MAX_LINES = 80;
+
+function extractCodemodeFileOps(toolComp: any): Array<{ type: "edit" | "write"; path: string; status?: string }> {
+	const ops: Array<{ type: "edit" | "write"; path: string; status?: string }> = [];
+	const seen = new Set<string>();
+	const calls = toolComp?.result?.details?.calls;
+	if (Array.isArray(calls)) {
+		for (const call of calls) {
+			if (call?.name !== "edit" && call?.name !== "write") continue;
+			let filePath = "";
+			if (typeof call.args === "string") {
+				const m = call.args.match(/"(?:path|file_path)"\s*:\s*"([^"]+)"/);
+				if (m?.[1]) filePath = m[1];
+			}
+			const key = `${call.name}:${filePath || ops.length}`;
+			if (!seen.has(key)) {
+				seen.add(key);
+				ops.push({ type: call.name, path: filePath, status: call.status });
+			}
+		}
+	}
+	if (ops.length === 0) {
+		const code = String(toolComp?.args?.code ?? "");
+		const re = /\btools\.(edit|write)\s*\(\s*\{[^}]*?\bpath\s*:\s*["'`]([^"'`]+)["'`]/gs;
+		for (const m of code.matchAll(re)) {
+			const type = m[1] as "edit" | "write";
+			const filePath = m[2] ?? "";
+			const key = `${type}:${filePath}`;
+			if (!seen.has(key)) {
+				seen.add(key);
+				ops.push({ type, path: filePath });
+			}
+		}
+		if (ops.length === 0) {
+			for (const m of code.matchAll(/\btools\.(edit|write)\s*\(/g)) {
+				const type = m[1] as "edit" | "write";
+				ops.push({ type, path: "" });
+			}
+		}
+	}
+	return ops;
+}
+
+function isFileModificationTool(toolComp: any): boolean {
+	if (!(toolComp instanceof ToolExecutionComponent) || toolComp.hideComponent) {
+		return false;
+	}
+	const name = String(toolComp.toolName || "");
+	if (name === "edit" || name === "write") {
+		return true;
+	}
+	if (name === "codemode") {
+		return extractCodemodeFileOps(toolComp).length > 0;
+	}
+	return false;
+}
+
 function getConsecutiveToolGroup(toolComp: any): any[] {
+	if (isFileModificationTool(toolComp)) {
+		return [toolComp];
+	}
+
 	const parent = toolComp.__parentContainer;
 	if (!parent || !Array.isArray(parent.children)) {
 		return [toolComp];
@@ -816,7 +883,9 @@ function getConsecutiveToolGroup(toolComp: any): any[] {
 	}
 
 	const isTransparentIntermediate = (c: any): boolean => {
-		if (c instanceof ToolExecutionComponent) return true;
+		if (c instanceof ToolExecutionComponent) {
+			return !c.hideComponent && !isFileModificationTool(c);
+		}
 		if (c instanceof AssistantMessageComponent) {
 			return !isAssistantShowingAnything(c);
 		}
@@ -835,7 +904,11 @@ function getConsecutiveToolGroup(toolComp: any): any[] {
 
 	const group: any[] = [];
 	for (let i = startIdx; i <= endIdx; i++) {
-		if (children[i] instanceof ToolExecutionComponent && !children[i].hideComponent) {
+		if (
+			children[i] instanceof ToolExecutionComponent &&
+			!children[i].hideComponent &&
+			!isFileModificationTool(children[i])
+		) {
 			group.push(children[i]);
 		}
 	}
@@ -962,8 +1035,10 @@ function formatSingleToolLine(
 			resultDesc = fg("muted", `${lineCount}${trunc} lines`);
 		}
 	} else if (toolName === "edit") {
-		const p = shortenPath(String(args?.path ?? ""));
-		const pathStyled = hovered ? rgbFg(COLOR_CYAN, bold(p)) : fg("accent", p);
+		const p = shortenPath(String(args?.path ?? args?.file_path ?? ""));
+		const details = result?.details as EditToolDetails | undefined;
+		const firstLine = details?.firstChangedLine ? `:${details.firstChangedLine}` : "";
+		const pathStyled = hovered ? rgbFg(COLOR_CYAN, bold(`${p}${firstLine}`)) : `${fg("accent", bold(p))}${firstLine ? fg("warning", firstLine) : ""}`;
 		callDesc = `${fg("warning", "✏️ ")} ${fg("toolTitle", bold("edit"))} ${pathStyled}`;
 
 		if (isPartial) {
@@ -972,30 +1047,26 @@ function formatSingleToolLine(
 			const errLine = extractText(result).split("\n")[0] || "Edit failed";
 			resultDesc = fg("error", truncateToWidth(errLine, 36, "…"));
 		} else {
-			const details = result?.details as EditToolDetails | undefined;
-			if (details?.diff) {
-				let added = 0;
-				let removed = 0;
-				for (const l of details.diff.split("\n")) {
-					if (l.startsWith("+") && !l.startsWith("+++")) added++;
-					if (l.startsWith("-") && !l.startsWith("---")) removed++;
-				}
-				resultDesc = `${fg("toolDiffAdded", `+${added}`)} ${fg("dim", "/")} ${fg("toolDiffRemoved", `-${removed}`)}`;
+			const stats = getEditDiffStats(toolComp);
+			if (stats.added > 0 || stats.removed > 0) {
+				resultDesc = `${fg("toolDiffAdded", bold(`+${stats.added}`))} ${fg("dim", "/")} ${fg("toolDiffRemoved", bold(`-${stats.removed}`))}`;
 			} else {
 				resultDesc = fg("muted", "applied");
 			}
 		}
 	} else if (toolName === "write") {
-		const p = shortenPath(String(args?.path ?? ""));
-		const lineCount = typeof args?.content === "string" ? args.content.split("\n").length : 0;
-		const pathStyled = hovered ? rgbFg(COLOR_CYAN, bold(p)) : fg("accent", p);
+		const p = shortenPath(String(args?.path ?? args?.file_path ?? ""));
+		const contentStr = typeof args?.content === "string" ? args.content : "";
+		const lineCount = contentStr ? contentStr.split("\n").length : 0;
+		const pathStyled = hovered ? rgbFg(COLOR_CYAN, bold(p)) : fg("accent", bold(p));
 		callDesc = `${fg("success", "📝")} ${fg("toolTitle", bold("write"))} ${pathStyled}`;
 		if (isPartial) {
 			resultDesc = `${breatheText("Writing", COLOR_TEAL, COLOR_CYAN, 3.6)} ${renderBreathingWave(COLOR_TEAL, COLOR_CYAN, ["•", "•", "•"])}`;
 		} else if (isError) {
 			resultDesc = fg("error", "Write failed");
 		} else {
-			resultDesc = fg("muted", lineCount > 0 ? `${lineCount} lines` : "written");
+			const sizeStr = contentStr.length >= 1024 ? ` · ${(contentStr.length / 1024).toFixed(1)}KB` : "";
+			resultDesc = fg("muted", lineCount > 0 ? `${lineCount} lines${sizeStr}` : "written");
 		}
 	} else if (toolName === "web_search") {
 		const q = truncateToWidth(String(args?.query ?? ""), 48, "…");
@@ -1116,6 +1187,369 @@ function formatSingleToolLine(
 
 	const durPart = durStr ? ` ${fg("dim", `· ${durStr}`)}` : "";
 	return `${chevron}${statusIcon} ${callDesc} ${fg("dim", "·")} ${resultDesc}${durPart}`;
+}
+
+function getRawEditDiffLines(toolComp: any): string[] {
+	const diffStr = toolComp?.result?.details?.diff;
+	if (typeof diffStr === "string" && diffStr.trim().length > 0) {
+		return diffStr.split("\n");
+	}
+	const args = toolComp?.args || {};
+	const edits: Array<{ oldText?: string; newText?: string }> = Array.isArray(args.edits)
+		? args.edits
+		: typeof args.oldText === "string" || typeof args.newText === "string"
+			? [{ oldText: args.oldText, newText: args.newText }]
+			: [];
+	if (edits.length === 0) return [];
+
+	const fallback: string[] = [];
+	for (let idx = 0; idx < edits.length; idx++) {
+		if (idx > 0) fallback.push("   ...");
+		const ed = edits[idx]!;
+		if (typeof ed.oldText === "string" && ed.oldText.length > 0) {
+			for (const l of ed.oldText.replace(/\r\n/g, "\n").split("\n")) {
+				fallback.push(`-  ${l}`);
+			}
+		}
+		if (typeof ed.newText === "string" && ed.newText.length > 0) {
+			for (const l of ed.newText.replace(/\r\n/g, "\n").split("\n")) {
+				fallback.push(`+  ${l}`);
+			}
+		}
+	}
+	return fallback;
+}
+
+function getEditDiffStats(toolComp: any): { added: number; removed: number } {
+	const lines = getRawEditDiffLines(toolComp);
+	let added = 0;
+	let removed = 0;
+	for (const l of lines) {
+		if (l.startsWith("+") && !l.startsWith("+++")) added++;
+		else if (l.startsWith("-") && !l.startsWith("---")) removed++;
+	}
+	return { added, removed };
+}
+
+function isDiffChangeLine(line: string): boolean {
+	return (line.startsWith("+") && !line.startsWith("+++")) || (line.startsWith("-") && !line.startsWith("---"));
+}
+
+/**
+ * Condenses raw diff lines into a high-signal thumbnail preview:
+ * 1. Keeps at most 1 context line immediately adjacent to changed (+/-) lines.
+ * 2. Replaces multi-line unchanged gaps with a single `   ...` separator.
+ * 3. If a large replacement block has many `-` lines followed by `+` lines that would push all `+` lines
+ *    past `maxLines`, balances the preview so both removed and added lines are visible!
+ */
+function buildCondensedDiffThumbnail(
+	rawDiffLines: string[],
+	maxLines: number,
+): { previewLines: string[]; hiddenCount: number; totalChangeLines: number } {
+	if (rawDiffLines.length === 0) {
+		return { previewLines: [], hiddenCount: 0, totalChangeLines: 0 };
+	}
+
+	const totalChangeLines = rawDiffLines.filter(isDiffChangeLine).length;
+	const condensed: string[] = [];
+
+	for (let i = 0; i < rawDiffLines.length; i++) {
+		const line = rawDiffLines[i]!;
+		if (isDiffChangeLine(line)) {
+			condensed.push(line);
+			continue;
+		}
+		if (line.trim() === "...") {
+			if (condensed.length > 0 && condensed[condensed.length - 1]!.trim() !== "...") {
+				condensed.push("   ...");
+			}
+			continue;
+		}
+		// Context line: keep only if immediately adjacent (within 1 line) to a change line
+		const prevIsChange = i > 0 && isDiffChangeLine(rawDiffLines[i - 1]!);
+		const nextIsChange = i + 1 < rawDiffLines.length && isDiffChangeLine(rawDiffLines[i + 1]!);
+		if (prevIsChange || nextIsChange) {
+			condensed.push(line);
+		} else if (condensed.length > 0 && condensed[condensed.length - 1]!.trim() !== "...") {
+			condensed.push("   ...");
+		}
+	}
+
+	// Trim leading/trailing ellipsis separators
+	while (condensed.length > 0 && condensed[0]!.trim() === "...") {
+		condensed.shift();
+	}
+	while (condensed.length > 0 && condensed[condensed.length - 1]!.trim() === "...") {
+		condensed.pop();
+	}
+
+	if (condensed.length <= maxLines + 2) {
+		const shownChanges = condensed.filter(isDiffChangeLine).length;
+		const hiddenCount = Math.max(0, totalChangeLines - shownChanges);
+		return { previewLines: condensed, hiddenCount, totalChangeLines };
+	}
+
+	// Check if a naive slice(0, maxLines) would miss all `+` lines when `+` lines exist
+	const sliced = condensed.slice(0, maxLines);
+	const hasAddedInFull = condensed.some((l) => l.startsWith("+") && !l.startsWith("+++"));
+	const hasAddedInSlice = sliced.some((l) => l.startsWith("+") && !l.startsWith("+++"));
+
+	if (hasAddedInFull && !hasAddedInSlice && maxLines >= 6) {
+		const firstAddIdx = condensed.findIndex((l) => l.startsWith("+") && !l.startsWith("+++"));
+		if (firstAddIdx > 0) {
+			const headCount = Math.max(2, Math.floor((maxLines - 1) / 2));
+			const tailCount = Math.max(2, maxLines - 1 - headCount);
+			const balanced = [
+				...condensed.slice(0, headCount),
+				"   ...",
+				...condensed.slice(firstAddIdx, firstAddIdx + tailCount),
+			];
+			const shownChanges = balanced.filter(isDiffChangeLine).length;
+			return {
+				previewLines: balanced,
+				hiddenCount: Math.max(1, totalChangeLines - shownChanges),
+				totalChangeLines,
+			};
+		}
+	}
+
+	const shownChanges = sliced.filter(isDiffChangeLine).length;
+	const hiddenCount = Math.max(1, totalChangeLines - shownChanges);
+	return { previewLines: sliced, hiddenCount, totalChangeLines };
+}
+
+function styleSingleDiffLine(dLine: string): string {
+	const untabbed = dLine.replace(/\t/g, "  ");
+	if (untabbed.trim() === "..." || untabbed.trim() === "⋯") {
+		return fg("dim", "   ⋯");
+	}
+	if (untabbed.startsWith("+") && !untabbed.startsWith("+++")) {
+		return fg("toolDiffAdded", untabbed);
+	}
+	if (untabbed.startsWith("-") && !untabbed.startsWith("---")) {
+		return fg("toolDiffRemoved", untabbed);
+	}
+	return fg("toolDiffContext", untabbed);
+}
+
+function hasFileToolMoreLinesToExpand(toolComp: any): boolean {
+	const toolName = String(toolComp.toolName || "");
+	if (toolName === "edit") {
+		const rawLines = getRawEditDiffLines(toolComp);
+		const { hiddenCount, previewLines } = buildCondensedDiffThumbnail(rawLines, EDIT_THUMBNAIL_MAX_LINES);
+		return hiddenCount > 0 || rawLines.length > previewLines.length;
+	}
+	if (toolName === "write") {
+		const content = typeof toolComp.args?.content === "string" ? toolComp.args.content : "";
+		return content.split("\n").length > WRITE_THUMBNAIL_MAX_LINES;
+	}
+	return true;
+}
+
+function getFileToolViewMode(toolComp: any): "thumbnail" | "expanded" | "collapsed" {
+	if (toolComp.__fileViewMode === "expanded" || toolComp.__fileViewMode === "collapsed" || toolComp.__fileViewMode === "thumbnail") {
+		return toolComp.__fileViewMode;
+	}
+	return toolComp.__itemExpanded ? "expanded" : "thumbnail";
+}
+
+function renderStandaloneFileTool(toolComp: any, width: number, pad: string): string[] {
+	if (!toolComp.__startedAt) toolComp.__startedAt = Date.now();
+	const activeInTurn = Boolean(toolComp.isPartial) || isToolGroupStillActiveInTurn(toolComp);
+	if (activeInTurn) {
+		markAnimationActive();
+	}
+
+	const toolName = String(toolComp.toolName || "tool");
+	const hovered = isHovered(toolComp);
+	const viewMode = getFileToolViewMode(toolComp);
+	const isExpanded = viewMode === "expanded";
+	const isCollapsed = viewMode === "collapsed";
+	const hasMore = hasFileToolMoreLinesToExpand(toolComp);
+
+	const lines: string[] = [""];
+	const mainLine = formatSingleToolLine(toolComp, width - visibleWidth(pad), {
+		showChevron: true,
+		expanded: !isCollapsed,
+		hovered,
+		pulseFront: activeInTurn,
+	});
+
+	let hint = "";
+	if (!toolComp.isPartial && activeInTurn) {
+		const liveElapsed = formatDuration(Date.now() - toolComp.__startedAt);
+		const nextDots = renderBreathingWave(COLOR_PURPLE, COLOR_CYAN, ["•", "•", "•"]);
+		hint = `  ${breatheText("正在继续执行", COLOR_AMBER, COLOR_CYAN, 3.4)}${liveElapsed ? fg("dim", ` · ${liveElapsed}`) : ""} ${nextDots}`;
+	} else if (!toolComp.isPartial) {
+		if (hovered) {
+			if (isCollapsed) {
+				hint = `  ${rgbFg(COLOR_CYAN, bold("[ ✦ 点击展开变更预览 ]"))}`;
+			} else if (isExpanded) {
+				hint = `  ${rgbFg(COLOR_AMBER, bold("[ ✦ 点击收起为缩略预览 ]"))}`;
+			} else if (hasMore) {
+				hint = `  ${rgbFg(COLOR_CYAN, bold("[ ✦ 点击展开完整内容 ]"))}`;
+			} else {
+				hint = `  ${rgbFg(COLOR_AMBER, bold("[ ✦ 点击折叠收起 ]"))}`;
+			}
+		} else if (isCollapsed) {
+			hint = ` ${fg("dim", "(已折叠 · 点击展开预览)")}`;
+		} else if (isExpanded) {
+			hint = ` ${fg("dim", "(完整视图 · 点击收起为缩略)")}`;
+		}
+	}
+
+	lines.push(`${pad}${mainLine}${hint}`);
+
+	// Error state
+	if (toolComp.result?.isError && !toolComp.isPartial) {
+		const detailPrefix = `${pad}  ${fg("borderMuted", "╰─ ")}`;
+		const errLines = extractText(toolComp.result).trim().split("\n").filter(Boolean);
+		for (const errLine of errLines.slice(0, isExpanded ? 20 : 3)) {
+			lines.push(`${detailPrefix}${fg("error", truncateToWidth(errLine, Math.max(12, width - 8), "…"))}`);
+		}
+		return lines;
+	}
+
+	// Manually collapsed to 1-line header
+	if (isCollapsed) {
+		return lines;
+	}
+
+	const pipeChar = hovered ? rgbFg(COLOR_CYAN, "│ ") : fg("borderMuted", "│ ");
+	const cornerChar = hovered ? rgbFg(COLOR_CYAN, "╰─") : fg("borderMuted", "╰─");
+	const bodyPrefix = `${pad}  ${pipeChar}`;
+	const innerWidth = Math.max(12, width - visibleWidth(bodyPrefix));
+
+	// 1. `edit` tool: compact thumbnail diff vs full diff
+	if (toolName === "edit") {
+		const rawDiffLines = getRawEditDiffLines(toolComp);
+		if (rawDiffLines.length === 0) {
+			return lines;
+		}
+
+		if (isExpanded) {
+			const shown = rawDiffLines.slice(0, EDIT_EXPANDED_MAX_LINES);
+			for (const dLine of shown) {
+				const styled = styleSingleDiffLine(dLine);
+				for (const w of wrapTextWithAnsi(styled, innerWidth)) {
+					lines.push(`${bodyPrefix}${w}`);
+				}
+			}
+			if (rawDiffLines.length > EDIT_EXPANDED_MAX_LINES) {
+				lines.push(
+					`${pad}  ${cornerChar} ${fg("dim", `⋯ 省略剩余 ${rawDiffLines.length - EDIT_EXPANDED_MAX_LINES} 行 · 点击收起为缩略视图`)}`,
+				);
+			} else {
+				const collapseHint = hovered
+					? rgbFg(COLOR_AMBER, bold("▲ 点击收起为缩略预览"))
+					: fg("dim", "▲ 点击收起为缩略预览");
+				lines.push(`${pad}  ${cornerChar} ${collapseHint}`);
+			}
+			return lines;
+		}
+
+		// Thumbnail mode (default): compact 1-line context diff, single-line truncated
+		const { previewLines, hiddenCount } = buildCondensedDiffThumbnail(rawDiffLines, EDIT_THUMBNAIL_MAX_LINES);
+		const extraContextLines = Math.max(0, rawDiffLines.length - previewLines.length);
+
+		for (const dLine of previewLines) {
+			const styled = styleSingleDiffLine(dLine);
+			lines.push(`${bodyPrefix}${truncateToWidth(styled, innerWidth, "…")}`);
+		}
+
+		if (hiddenCount > 0) {
+			const stats = getEditDiffStats(toolComp);
+			const footerText = hovered
+				? rgbFg(
+						COLOR_CYAN,
+						bold(`✦ 还有 ${hiddenCount} 行变更未显示 (共 +${stats.added} / -${stats.removed}) · 点击展开完整 Diff`),
+					)
+				: `${fg("dim", `⋯ 还有 ${hiddenCount} 行变更`)} ${fg("dim", `(点击展开完整 Diff)`)}`;
+			lines.push(`${pad}  ${cornerChar} ${footerText}`);
+		} else if (extraContextLines > 0 && hovered) {
+			lines.push(
+				`${pad}  ${cornerChar} ${rgbFg(COLOR_CYAN, `✦ 点击展开含完整上下文的 Diff (共 ${rawDiffLines.length} 行)`)}`,
+			);
+		}
+		return lines;
+	}
+
+	// 2. `write` tool: compact file head preview vs full content
+	if (toolName === "write") {
+		const rawContent = typeof toolComp.args?.content === "string" ? toolComp.args.content.replace(/\r\n/g, "\n") : "";
+		if (!rawContent) {
+			return lines;
+		}
+		const contentLines = rawContent.split("\n");
+		const totalLines = contentLines.length;
+		const lineNumWidth = Math.max(2, String(Math.min(totalLines, WRITE_EXPANDED_MAX_LINES)).length);
+
+		if (isExpanded) {
+			const shown = contentLines.slice(0, WRITE_EXPANDED_MAX_LINES);
+			for (let i = 0; i < shown.length; i++) {
+				const num = String(i + 1).padStart(lineNumWidth, " ");
+				const code = shown[i]!.replace(/\t/g, "  ");
+				const styled = `${fg("dim", num)}  ${fg("toolDiffAdded", code)}`;
+				for (const w of wrapTextWithAnsi(styled, innerWidth)) {
+					lines.push(`${bodyPrefix}${w}`);
+				}
+			}
+			const remaining = totalLines - shown.length;
+			const footer =
+				remaining > 0
+					? `${fg("dim", `⋯ 还有 ${remaining} 行内容 · 点击收起为缩略预览`)}`
+					: hovered
+						? rgbFg(COLOR_AMBER, bold("▲ 点击收起为缩略预览"))
+						: fg("dim", "▲ 点击收起为缩略预览");
+			lines.push(`${pad}  ${cornerChar} ${footer}`);
+			return lines;
+		}
+
+		// Thumbnail mode (default): first 6 lines
+		const shown = contentLines.slice(0, WRITE_THUMBNAIL_MAX_LINES);
+		for (let i = 0; i < shown.length; i++) {
+			const num = String(i + 1).padStart(lineNumWidth, " ");
+			const code = shown[i]!.replace(/\t/g, "  ");
+			const styled = `${fg("dim", `+${num}`)} ${fg("toolDiffAdded", code)}`;
+			lines.push(`${bodyPrefix}${truncateToWidth(styled, innerWidth, "…")}`);
+		}
+		const remaining = totalLines - shown.length;
+		if (remaining > 0) {
+			const footerText = hovered
+				? rgbFg(COLOR_CYAN, bold(`✦ 还有 ${remaining} 行内容 (共 ${totalLines} 行) · 点击展开完整文件`))
+				: `${fg("dim", `⋯ 还有 ${remaining} 行内容`)} ${fg("dim", `(共 ${totalLines} 行 · 点击展开)`)}`;
+			lines.push(`${pad}  ${cornerChar} ${footerText}`);
+		}
+		return lines;
+	}
+
+	// 3. `codemode` with nested `edit`/`write` calls
+	const fileOps = extractCodemodeFileOps(toolComp);
+	if (fileOps.length > 0) {
+		const maxOps = isExpanded ? fileOps.length : Math.min(4, fileOps.length);
+		for (let i = 0; i < maxOps; i++) {
+			const op = fileOps[i]!;
+			const isLastOp = i === maxOps - 1 && (!isExpanded || fileOps.length <= maxOps);
+			const prefix = isLastOp && !isExpanded && fileOps.length <= maxOps ? `${pad}  ${cornerChar} ` : bodyPrefix;
+			const icon = op.type === "edit" ? fg("warning", "✏️ ") : fg("success", "📝");
+			const label = fg("toolTitle", bold(op.type));
+			const p = op.path ? fg("accent", bold(shortenPath(op.path))) : fg("muted", "(file)");
+			const st =
+				op.status === "error"
+					? ` · ${fg("error", "failed")}`
+					: op.status === "running"
+						? ` · ${breatheText("running", COLOR_AMBER, COLOR_CYAN, 3.6)}`
+						: ` · ${fg("toolDiffAdded", op.type === "edit" ? "updated" : "written")}`;
+			lines.push(`${prefix}${icon} ${label} ${p}${st}`);
+		}
+		if (!isExpanded && fileOps.length > maxOps) {
+			lines.push(`${pad}  ${cornerChar} ${fg("dim", `⋯ 还有 ${fileOps.length - maxOps} 个文件变更 (点击展开)`)}`);
+		} else if (isExpanded) {
+			lines.push(...renderToolExpandedDetails(toolComp, width, bodyPrefix));
+		}
+	}
+
+	return lines;
 }
 
 function renderToolExpandedDetails(toolComp: any, width: number, indentPrefix: string): string[] {
@@ -1293,6 +1727,7 @@ function installGroupedToolRenderer(): void {
 		const wasInChat = Boolean(this.__parentContainer);
 		this.__itemExpanded = expanded;
 		if (wasInChat) {
+			this.__fileViewMode = expanded ? "expanded" : "thumbnail";
 			const group = getConsecutiveToolGroup(this);
 			if (group[0]) {
 				group[0].__groupExpanded = expanded;
@@ -1316,6 +1751,13 @@ function installGroupedToolRenderer(): void {
 		}
 
 		const pad = " ".repeat(this.outputPad ?? 1);
+
+		// Standalone file modification card (edit / write / codemode with file edits):
+		// Never buried in a consecutive command group; shows a balanced compact diff/content thumbnail by default!
+		if (isFileModificationTool(this)) {
+			return renderStandaloneFileTool(this, width, pad);
+		}
+
 		const group = getConsecutiveToolGroup(this);
 		const total = group.length;
 		const myIndex = group.indexOf(this);
@@ -1528,6 +1970,21 @@ function installGroupedToolRenderer(): void {
 
 		if (event.type !== "click" || event.button !== "left") {
 			return undefined;
+		}
+
+		if (isFileModificationTool(this)) {
+			const currentMode = getFileToolViewMode(this);
+			const hasMore = hasFileToolMoreLinesToExpand(this);
+			if (currentMode === "thumbnail") {
+				this.__fileViewMode = hasMore ? "expanded" : "collapsed";
+			} else if (currentMode === "expanded") {
+				this.__fileViewMode = "thumbnail";
+			} else {
+				this.__fileViewMode = "thumbnail";
+			}
+			this.__itemExpanded = this.__fileViewMode === "expanded";
+			this.ui?.requestRender();
+			return { handled: true, render: true };
 		}
 
 		const group = getConsecutiveToolGroup(this);

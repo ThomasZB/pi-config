@@ -62,6 +62,13 @@ interface CompactionModelConfig {
 }
 
 interface RawSettingsFile {
+	fastModel?: string | string[];
+	fastThinkingLevel?: string;
+	fast?: {
+		model?: string | string[];
+		thinkingLevel?: string;
+		[key: string]: unknown;
+	};
 	compactionModel?: string | string[];
 	compactionThinkingLevel?: string;
 	compaction?: {
@@ -135,11 +142,15 @@ async function updateJsonSettings(
 }
 
 function resolveConfig(pi: ExtensionAPI, cwd: string): CompactionModelConfig {
-	const flagModel = pi.getFlag("compact-model");
+	const flagModel = pi.getFlag("fast-model") ?? pi.getFlag("compact-model");
 	const flagCandidates = parseModelCandidates(flagModel);
 
-	const envCandidates = parseModelCandidates(process.env.PI_COMPACTION_MODEL);
-	const envThinking = parseThinkingLevel(process.env.PI_COMPACTION_THINKING);
+	const envCandidates = parseModelCandidates(
+		process.env.PI_FAST_MODEL ?? process.env.PI_COMPACTION_MODEL,
+	);
+	const envThinking = parseThinkingLevel(
+		process.env.PI_FAST_THINKING ?? process.env.PI_COMPACTION_THINKING,
+	);
 
 	const projectSettingsPath = path.join(cwd, ".pi", "settings.json");
 	const globalSettingsPath = path.join(getAgentDir(), "settings.json");
@@ -148,17 +159,29 @@ function resolveConfig(pi: ExtensionAPI, cwd: string): CompactionModelConfig {
 	const globalSettings = readJsonSettings(globalSettingsPath);
 
 	const projectCandidates = parseModelCandidates(
-		projectSettings?.compaction?.model ?? projectSettings?.compactionModel,
+		projectSettings?.fast?.model ??
+			projectSettings?.fastModel ??
+			projectSettings?.compaction?.model ??
+			projectSettings?.compactionModel,
 	);
 	const globalCandidates = parseModelCandidates(
-		globalSettings?.compaction?.model ?? globalSettings?.compactionModel,
+		globalSettings?.fast?.model ??
+			globalSettings?.fastModel ??
+			globalSettings?.compaction?.model ??
+			globalSettings?.compactionModel,
 	);
 
 	const projectThinking = parseThinkingLevel(
-		projectSettings?.compaction?.thinkingLevel ?? projectSettings?.compactionThinkingLevel,
+		projectSettings?.fast?.thinkingLevel ??
+			projectSettings?.fastThinkingLevel ??
+			projectSettings?.compaction?.thinkingLevel ??
+			projectSettings?.compactionThinkingLevel,
 	);
 	const globalThinking = parseThinkingLevel(
-		globalSettings?.compaction?.thinkingLevel ?? globalSettings?.compactionThinkingLevel,
+		globalSettings?.fast?.thinkingLevel ??
+			globalSettings?.fastThinkingLevel ??
+			globalSettings?.compaction?.thinkingLevel ??
+			globalSettings?.compactionThinkingLevel,
 	);
 
 	const thinkingLevel = envThinking ?? projectThinking ?? globalThinking;
@@ -359,8 +382,12 @@ function isFastModel(model: Model<Api>): boolean {
 }
 
 export default function compactionModelExtension(pi: ExtensionAPI): void {
+	pi.registerFlag("fast-model", {
+		description: "Lightweight model for compaction, scout exploration, and branch summaries (e.g. anthropic/claude-haiku-4-5)",
+		type: "string",
+	});
 	pi.registerFlag("compact-model", {
-		description: "Model to use for context compaction (e.g. anthropic/claude-haiku-4-5)",
+		description: "Alias for --fast-model",
 		type: "string",
 	});
 
@@ -486,250 +513,258 @@ export default function compactionModelExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Register /compact-model command for interactive configuration
-	pi.registerCommand("compact-model", {
-		description: "查看或设置独立的上下文压缩模型 (如 Haiku / Flash)",
-		getArgumentCompletions: (prefix: string) => {
-			const trimmed = prefix.trim().toLowerCase();
-			const staticItems = [
-				{ value: "status", label: "status — 查看当前压缩模型配置" },
-				{ value: "off", label: "off — 恢复默认（跟随当前对话模型）" },
-				{ value: "thinking off", label: "thinking off — 压缩时关闭思考 (推荐)" },
-				{ value: "thinking low", label: "thinking low — 压缩时使用低强度思考" },
-			];
-			return staticItems.filter((item) => item.value.toLowerCase().startsWith(trimmed));
-		},
-		handler: async (args, ctx) => {
-			const rawArgs = args.trim();
-			const globalSettingsPath = path.join(getAgentDir(), "settings.json");
-			const projectSettingsPath = path.join(ctx.cwd, ".pi", "settings.json");
+	const fastModelCommandHandler = async (args: string, ctx: ExtensionContext) => {
+		const rawArgs = args.trim();
+		const globalSettingsPath = path.join(getAgentDir(), "settings.json");
+		const projectSettingsPath = path.join(ctx.cwd, ".pi", "settings.json");
 
-			// 1. Status check
-			if (rawArgs === "status") {
-				const config = resolveConfig(pi, ctx.cwd);
-				if (config.models.length === 0) {
-					const activeModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "未选择";
-					const thinkingNote = config.thinkingLevel
-						? `（压缩思考档位覆盖为: ${config.thinkingLevel}）`
-						: "";
-					ctx.ui.notify(
-						`当前压缩模型: 跟随主对话模型 (${activeModel}) ${thinkingNote}`,
-						"info",
-					);
-					return;
+		const clearFastModelSettings = (data: RawSettingsFile) => {
+			delete data.fastModel;
+			delete data.fast;
+			delete data.compactionModel;
+			if (data.compaction && typeof data.compaction === "object") {
+				delete data.compaction.model;
+				if (Object.keys(data.compaction).length === 0) {
+					delete data.compaction;
 				}
-				const target = await resolveCompactionTarget(pi, ctx);
-				const resolvedStr = target
-					? `✅ 已就绪: ${target.model.provider}/${target.model.id} (thinking: ${target.thinkingLevel})`
-					: "⚠️ 未匹配到可用模型，将回退到主模型";
+			}
+		};
+
+		const saveFastModelSettings = (
+			data: RawSettingsFile,
+			modelValue: string | string[],
+			thinkingLevel?: ThinkingLevel,
+		) => {
+			data.fastModel = modelValue;
+			// Clean legacy duplicate keys so settings.json stays tidy
+			delete data.fast;
+			delete data.compactionModel;
+			if (data.compaction && typeof data.compaction === "object") {
+				delete data.compaction.model;
+				if (thinkingLevel) {
+					data.compaction.thinkingLevel = thinkingLevel;
+				}
+				if (
+					Object.keys(data.compaction).length === 0 ||
+					(Object.keys(data.compaction).length === 1 && data.compaction.thinkingLevel === "off")
+				) {
+					delete data.compaction;
+				}
+			}
+		};
+
+		// 1. Status check
+		if (rawArgs === "status") {
+			const config = resolveConfig(pi, ctx.cwd);
+			if (config.models.length === 0) {
+				const activeModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "未选择";
+				const thinkingNote = config.thinkingLevel
+					? `（思考档位覆盖为: ${config.thinkingLevel}）`
+					: "";
 				ctx.ui.notify(
-					`压缩模型配置 [${config.source}]: ${config.models.join(", ")} → ${resolvedStr}`,
+					`当前轻量模型 (压缩 + Scout探索): 未单独配置，跟随主模型 (${activeModel}) ${thinkingNote}`,
 					"info",
 				);
 				return;
 			}
-
-			// 2. Reset / turn off
-			if (rawArgs === "off" || rawArgs === "default" || rawArgs === "clear" || rawArgs === "reset") {
-				await updateJsonSettings(globalSettingsPath, (data) => {
-					delete data.compactionModel;
-					if (data.compaction && typeof data.compaction === "object") {
-						delete data.compaction.model;
-						if (Object.keys(data.compaction).length === 0) {
-							delete data.compaction;
-						}
-					}
-				});
-				if (fs.existsSync(projectSettingsPath)) {
-					await updateJsonSettings(projectSettingsPath, (data) => {
-						delete data.compactionModel;
-						if (data.compaction && typeof data.compaction === "object") {
-							delete data.compaction.model;
-							if (Object.keys(data.compaction).length === 0) {
-								delete data.compaction;
-							}
-						}
-					});
-				}
-				ctx.ui.notify("✅ 已恢复默认：压缩时将直接使用当前主对话模型", "info");
-				return;
-			}
-
-			// 3. Set thinking level: `/compact-model thinking <level>`
-			if (rawArgs.startsWith("thinking ")) {
-				const levelArg = rawArgs.slice("thinking ".length).trim();
-				const level = parseThinkingLevel(levelArg);
-				if (!level) {
-					ctx.ui.notify(
-						`无效的思考等级 "${levelArg}"，可选值: ${VALID_THINKING_LEVELS.join(", ")}`,
-						"warning",
-					);
-					return;
-				}
-				await updateJsonSettings(globalSettingsPath, (data) => {
-					if (!data.compaction || typeof data.compaction !== "object") {
-						data.compaction = {};
-					}
-					data.compaction.thinkingLevel = level;
-				});
-				ctx.ui.notify(`✅ 已将压缩思考等级设置为: ${level} (${globalSettingsPath})`, "info");
-				return;
-			}
-
-			// 4. Direct model argument: `/compact-model [-p|--project] <model>`
-			if (rawArgs.length > 0) {
-				let isProject = false;
-				let modelSpec = rawArgs;
-				if (modelSpec.startsWith("-p ") || modelSpec.startsWith("--project ")) {
-					isProject = true;
-					modelSpec = modelSpec.replace(/^(-p|--project)\s+/, "").trim();
-				}
-
-				const targetFile = isProject ? projectSettingsPath : globalSettingsPath;
-				const candidates = parseModelCandidates(modelSpec);
-				if (candidates.length === 0) {
-					ctx.ui.notify("请提供有效的模型标识，例如: anthropic/claude-haiku-4-5", "warning");
-					return;
-				}
-
-				const matched = findCandidateModel(ctx, candidates[0]);
-				const savedValue =
-					candidates.length === 1 && matched
-						? `${matched.model.provider}/${matched.model.id}`
-						: candidates.length === 1
-							? candidates[0]
-							: candidates;
-
-				await updateJsonSettings(targetFile, (data) => {
-					if (!data.compaction || typeof data.compaction !== "object") {
-						data.compaction = {};
-					}
-					data.compaction.model = savedValue;
-					if (!data.compaction.thinkingLevel) {
-						data.compaction.thinkingLevel = "off";
-					}
-				});
-
-				if (matched) {
-					ctx.ui.notify(
-						`✅ 已设置${isProject ? "项目" : "全局"}压缩模型: ${matched.model.provider}/${matched.model.id} (thinking: off)`,
-						"info",
-					);
-				} else {
-					ctx.ui.notify(
-						`⚠️ 已写入配置 "${modelSpec}" 到 ${targetFile}，但当前可用模型列表中暂未找到匹配项`,
-						"warning",
-					);
-				}
-				return;
-			}
-
-			// 5. Interactive selector when called without arguments
-			const config = resolveConfig(pi, ctx.cwd);
-			const availableModels = ctx.modelRegistry.getAvailable();
-
-			// Sort fast/flash/haiku models first for convenience
-			const sortedModels = [...availableModels].sort((a, b) => {
-				const aFast = isFastModel(a) ? 0 : 1;
-				const bFast = isFastModel(b) ? 0 : 1;
-				if (aFast !== bFast) return aFast - bFast;
-				return `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`);
-			});
-
-			const currentDesc =
-				config.models.length > 0
-					? `当前配置: ${config.models.join(", ")} (thinking: ${config.thinkingLevel ?? "off"})`
-					: "当前配置: 跟随主对话模型";
-
-			const FOLLOW_DEFAULT_OPTION = "🔄 跟随主对话模型 (默认)";
-			const options: string[] = [
-				FOLLOW_DEFAULT_OPTION,
-				...sortedModels.map((m) => {
-					const fullId = `${m.provider}/${m.id}`;
-					const tag = isFastModel(m) ? " ⚡ 推荐轻量/快速" : "";
-					const activeMark = config.models.includes(fullId) || config.models.includes(m.id) ? " ✓" : "";
-					return `${fullId}${tag}${activeMark}`;
-				}),
-			];
-
-			const title = `选择上下文压缩模型 (${currentDesc})`;
-			const choice = ctx.mode === "tui"
-				? await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
-					const search = new Input({ prompt: "搜索: ", placeholder: "模型名称或提供商" });
-					const items = options.map((label) => ({ value: label, label }));
-					let filtered = items;
-					let selectedIndex = 0;
-					let list: SelectList | undefined;
-					return {
-						get focused() { return search.focused; },
-						set focused(value: boolean) { search.focused = value; },
-						render(width: number) {
-							// Reserve room for the title, search, hints, and scroll indicator.
-							const visibleRows = Math.max(1, Math.min(10, tui.terminal.rows - 8));
-							list = new SelectList(filtered, visibleRows, {
-								selectedPrefix: (text) => theme.fg("accent", text),
-								selectedText: (text) => theme.fg("accent", text),
-								description: (text) => theme.fg("muted", text),
-								scrollInfo: (text) => theme.fg("dim", text),
-								noMatch: () => theme.fg("muted", "  没有匹配的模型"),
-							});
-							list.setSelectedIndex(selectedIndex);
-							list.onSelectionChange = (item) => { selectedIndex = filtered.indexOf(item); };
-							list.onSelect = (item) => done(item.value);
-							list.onCancel = () => done(undefined);
-							return [
-								truncateToWidth(theme.fg("accent", title), width),
-								...search.render(width),
-								...list.render(width),
-								truncateToWidth(theme.fg("dim", "输入筛选 · ↑↓ 选择 · Enter 确认 · Esc 取消"), width),
-							];
-						},
-						handleInput(data: string) {
-							if ((["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const)
-								.some((action) => keybindings.matches(data, action))) {
-								list?.handleInput(data);
-							} else {
-								search.handleInput(data);
-								filtered = fuzzyFilter(items, search.getValue(), (item) => item.label);
-								selectedIndex = 0;
-							}
-							tui.requestRender();
-						},
-						invalidate() { search.invalidate(); list?.invalidate(); },
-					};
-				})
-				: await ctx.ui.select(title, options);
-			if (!choice) return;
-
-			if (choice === FOLLOW_DEFAULT_OPTION) {
-				await updateJsonSettings(globalSettingsPath, (data) => {
-					delete data.compactionModel;
-					if (data.compaction && typeof data.compaction === "object") {
-						delete data.compaction.model;
-						if (Object.keys(data.compaction).length === 0) {
-							delete data.compaction;
-						}
-					}
-				});
-				ctx.ui.notify("✅ 已恢复默认：压缩时跟随当前主对话模型", "info");
-				return;
-			}
-
-			const selectedFullId = choice.split(" ")[0].trim();
-			await updateJsonSettings(globalSettingsPath, (data) => {
-				if (!data.compaction || typeof data.compaction !== "object") {
-					data.compaction = {};
-				}
-				data.compaction.model = selectedFullId;
-				if (!data.compaction.thinkingLevel) {
-					data.compaction.thinkingLevel = "off";
-				}
-			});
-
+			const target = await resolveCompactionTarget(pi, ctx);
+			const resolvedStr = target
+				? `✅ 已就绪: ${target.model.provider}/${target.model.id} (thinking: ${target.thinkingLevel})`
+				: "⚠️ 未匹配到可用模型，将回退到主模型";
 			ctx.ui.notify(
-				`✅ 已设置全局压缩模型: ${selectedFullId} (thinking: ${config.thinkingLevel ?? "off"})`,
+				`轻量模型配置 [${config.source}] (用于压缩 + Scout探索): ${config.models.join(", ")} → ${resolvedStr}`,
 				"info",
 			);
-		},
+			return;
+		}
+
+		// 2. Reset / turn off
+		if (rawArgs === "off" || rawArgs === "default" || rawArgs === "clear" || rawArgs === "reset") {
+			await updateJsonSettings(globalSettingsPath, clearFastModelSettings);
+			if (fs.existsSync(projectSettingsPath)) {
+				await updateJsonSettings(projectSettingsPath, clearFastModelSettings);
+			}
+			ctx.ui.notify("✅ 已恢复默认：上下文压缩与 Scout 探索将跟随当前主对话模型", "info");
+			return;
+		}
+
+		// 3. Set thinking level: `/fast-model thinking <level>`
+		if (rawArgs.startsWith("thinking ")) {
+			const levelArg = rawArgs.slice("thinking ".length).trim();
+			const level = parseThinkingLevel(levelArg);
+			if (!level) {
+				ctx.ui.notify(
+					`无效的思考等级 "${levelArg}"，可选值: ${VALID_THINKING_LEVELS.join(", ")}`,
+					"warning",
+				);
+				return;
+			}
+			await updateJsonSettings(globalSettingsPath, (data) => {
+				data.fastThinkingLevel = level === "off" ? undefined : level;
+				if (data.compaction && typeof data.compaction === "object") {
+					delete data.compaction.thinkingLevel;
+					if (Object.keys(data.compaction).length === 0) delete data.compaction;
+				}
+			});
+			ctx.ui.notify(`✅ 已将轻量模型思考等级设置为: ${level}`, "info");
+			return;
+		}
+
+		// 4. Direct model argument: `/fast-model [-p|--project] <model>`
+		if (rawArgs.length > 0) {
+			let isProject = false;
+			let modelSpec = rawArgs;
+			if (modelSpec.startsWith("-p ") || modelSpec.startsWith("--project ")) {
+				isProject = true;
+				modelSpec = modelSpec.replace(/^(-p|--project)\s+/, "").trim();
+			}
+
+			const targetFile = isProject ? projectSettingsPath : globalSettingsPath;
+			const candidates = parseModelCandidates(modelSpec);
+			if (candidates.length === 0) {
+				ctx.ui.notify("请提供有效的模型标识，例如: anthropic/claude-haiku-4-5", "warning");
+				return;
+			}
+
+			const matched = findCandidateModel(ctx, candidates[0]);
+			const savedValue =
+				candidates.length === 1 && matched
+					? `${matched.model.provider}/${matched.model.id}`
+					: candidates.length === 1
+						? candidates[0]
+						: candidates;
+
+			await updateJsonSettings(targetFile, (data) => {
+				saveFastModelSettings(data, savedValue, "off");
+			});
+
+			if (matched) {
+				ctx.ui.notify(
+					`✅ 已设置${isProject ? "项目" : "全局"}轻量模型 (压缩 + Scout探索): ${matched.model.provider}/${matched.model.id}`,
+					"info",
+				);
+			} else {
+				ctx.ui.notify(
+					`⚠️ 已写入配置 "${modelSpec}" 到 ${targetFile}，但当前可用模型列表中暂未找到匹配项`,
+					"warning",
+				);
+			}
+			return;
+		}
+
+		// 5. Interactive selector when called without arguments
+		const config = resolveConfig(pi, ctx.cwd);
+		const availableModels = ctx.modelRegistry.getAvailable();
+
+		// Sort fast/flash/haiku models first for convenience
+		const sortedModels = [...availableModels].sort((a, b) => {
+			const aFast = isFastModel(a) ? 0 : 1;
+			const bFast = isFastModel(b) ? 0 : 1;
+			if (aFast !== bFast) return aFast - bFast;
+			return `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`);
+		});
+
+		const currentDesc =
+			config.models.length > 0
+				? `当前: ${config.models.join(", ")}`
+				: "当前: 跟随主模型";
+
+		const FOLLOW_DEFAULT_OPTION = "🔄 跟随主对话模型 (默认)";
+		const options: string[] = [
+			FOLLOW_DEFAULT_OPTION,
+			...sortedModels.map((m) => {
+				const fullId = `${m.provider}/${m.id}`;
+				const tag = isFastModel(m) ? " ⚡ 推荐轻量/快速" : "";
+				const activeMark = config.models.includes(fullId) || config.models.includes(m.id) ? " ✓" : "";
+				return `${fullId}${tag}${activeMark}`;
+			}),
+		];
+
+		const title = `选择轻量模型 Fast Model — 用于上下文压缩 & Scout 探索 (${currentDesc})`;
+		const choice = ctx.mode === "tui"
+			? await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+				const search = new Input({ prompt: "搜索: ", placeholder: "模型名称或提供商 (如 haiku / flash)" });
+				const items = options.map((label) => ({ value: label, label }));
+				let filtered = items;
+				let selectedIndex = 0;
+				let list: SelectList | undefined;
+				return {
+					get focused() { return search.focused; },
+					set focused(value: boolean) { search.focused = value; },
+					render(width: number) {
+						const visibleRows = Math.max(1, Math.min(10, tui.terminal.rows - 8));
+						list = new SelectList(filtered, visibleRows, {
+							selectedPrefix: (text) => theme.fg("accent", text),
+							selectedText: (text) => theme.fg("accent", text),
+							description: (text) => theme.fg("muted", text),
+							scrollInfo: (text) => theme.fg("dim", text),
+							noMatch: () => theme.fg("muted", "  没有匹配的模型"),
+						});
+						list.setSelectedIndex(selectedIndex);
+						list.onSelectionChange = (item) => { selectedIndex = filtered.indexOf(item); };
+						list.onSelect = (item) => done(item.value);
+						list.onCancel = () => done(undefined);
+						return [
+							truncateToWidth(theme.fg("accent", title), width),
+							...search.render(width),
+							...list.render(width),
+							truncateToWidth(theme.fg("dim", "输入筛选 · ↑↓ 选择 · Enter 确认 · Esc 取消"), width),
+						];
+					},
+					handleInput(data: string) {
+						if ((["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const)
+							.some((action) => keybindings.matches(data, action))) {
+							list?.handleInput(data);
+						} else {
+							search.handleInput(data);
+							filtered = fuzzyFilter(items, search.getValue(), (item) => item.label);
+							selectedIndex = 0;
+						}
+						tui.requestRender();
+					},
+					invalidate() { search.invalidate(); list?.invalidate(); },
+				};
+			})
+			: await ctx.ui.select(title, options);
+		if (!choice) return;
+
+		if (choice === FOLLOW_DEFAULT_OPTION) {
+			await updateJsonSettings(globalSettingsPath, clearFastModelSettings);
+			ctx.ui.notify("✅ 已恢复默认：上下文压缩与 Scout 探索将跟随当前主对话模型", "info");
+			return;
+		}
+
+		const selectedFullId = choice.split(" ")[0].trim();
+		await updateJsonSettings(globalSettingsPath, (data) => {
+			saveFastModelSettings(data, selectedFullId, "off");
+		});
+
+		ctx.ui.notify(
+			`✅ 已设置全局轻量模型 (压缩 + Scout探索): ${selectedFullId}`,
+			"info",
+		);
+	};
+
+	const commandCompletions = (prefix: string) => {
+		const trimmed = prefix.trim().toLowerCase();
+		const staticItems = [
+			{ value: "status", label: "status — 查看当前轻量模型配置" },
+			{ value: "off", label: "off — 恢复默认（跟随当前主模型）" },
+			{ value: "thinking off", label: "thinking off — 关闭轻量模型思考 (推荐)" },
+			{ value: "thinking low", label: "thinking low — 使用低强度思考" },
+		];
+		return staticItems.filter((item) => item.value.toLowerCase().startsWith(trimmed));
+	};
+
+	pi.registerCommand("fast-model", {
+		description: "查看或设置轻量模型 Fast Model (统一用于上下文压缩 /compact、Scout 代码探索、分支摘要)",
+		getArgumentCompletions: commandCompletions,
+		handler: fastModelCommandHandler,
+	});
+
+	pi.registerCommand("compact-model", {
+		description: "查看或设置轻量模型 (同 /fast-model)",
+		getArgumentCompletions: commandCompletions,
+		handler: fastModelCommandHandler,
 	});
 }

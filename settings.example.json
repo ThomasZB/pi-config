@@ -2,6 +2,7 @@
   "$schema": "https://pi.dev/schemas/settings.schema.json",
   "theme": "catppuccin-latte/tokyo-night",
   "defaultTools": ["+grep", "+find", "+ls", "+codemode"],
+  "fastModel": "anthropic/claude-haiku-4-5",
   "web": {
     "deepseekApiKeyEnv": "DEEPSEEK_API_KEY"
   },

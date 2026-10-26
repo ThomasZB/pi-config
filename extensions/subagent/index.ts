@@ -17,11 +17,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
+import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
-import {
-	CONFIG_DIR_NAME,
+import {\n\tCONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionContext,
 	formatReadLineRange,
 	getAgentDir,
 	getMarkdownTheme,
@@ -35,6 +35,270 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode"]);
+
+interface RawSubagentSettings {
+	fastModel?: string | string[];
+	fastThinkingLevel?: string;
+	fast?: {
+		model?: string | string[];
+		thinkingLevel?: string;
+	};
+	compactionModel?: string | string[];
+	compaction?: {
+		model?: string | string[];
+		thinkingLevel?: string;
+	};
+	subagent?: {
+		scoutModel?: string | string[];
+		models?: Record<string, string | string[]>;
+	};
+}
+
+function readJsonSettings(filePath: string): RawSubagentSettings | undefined {
+	if (!fs.existsSync(filePath)) return undefined;
+	try {
+		const raw = fs.readFileSync(filePath, "utf-8").replace(/^\uFEFF/, "");
+		const parsed = JSON.parse(raw);
+		return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+			? (parsed as RawSubagentSettings)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function parseModelCandidates(value: unknown): string[] {
+	if (typeof value === "string") {
+		const trimmed = value.trim();
+		if (!trimmed || trimmed === "default" || trimmed === "off" || trimmed === "none" || trimmed === "auto") {
+			return [];
+		}
+		return trimmed
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+	}
+	if (Array.isArray(value)) {
+		return value
+			.filter((item): item is string => typeof item === "string")
+			.map((s) => s.trim())
+			.filter(Boolean);
+	}
+	return [];
+}
+
+function parseThinkingLevel(value: unknown): ThinkingLevel | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase() as ThinkingLevel;
+	return VALID_THINKING_LEVELS.includes(normalized) ? normalized : undefined;
+}
+
+function findCandidateModel(
+	ctx: ExtensionContext,
+	spec: string,
+): { model: Model<Api>; thinkingOverride?: ThinkingLevel } | undefined {
+	let modelSpec = spec.trim();
+	let thinkingOverride: ThinkingLevel | undefined;
+
+	const colonIndex = modelSpec.lastIndexOf(":");
+	if (colonIndex > 0) {
+		const maybeLevel = parseThinkingLevel(modelSpec.slice(colonIndex + 1));
+		if (maybeLevel) {
+			thinkingOverride = maybeLevel;
+			modelSpec = modelSpec.slice(0, colonIndex);
+		}
+	}
+
+	const available = ctx.modelRegistry.getAvailable();
+	const allModels = ctx.modelRegistry.getAll();
+
+	const slashIndex = modelSpec.indexOf("/");
+	if (slashIndex > 0) {
+		const provider = modelSpec.slice(0, slashIndex).trim();
+		const modelId = modelSpec.slice(slashIndex + 1).trim();
+		const exact = ctx.modelRegistry.find(provider, modelId);
+		if (exact) return { model: exact, thinkingOverride };
+
+		const lowerProvider = provider.toLowerCase();
+		const lowerId = modelId.toLowerCase();
+		const ciMatch =
+			available.find(
+				(m) => m.provider.toLowerCase() === lowerProvider && m.id.toLowerCase() === lowerId,
+			) ??
+			allModels.find(
+				(m) => m.provider.toLowerCase() === lowerProvider && m.id.toLowerCase() === lowerId,
+			);
+		if (ciMatch) return { model: ciMatch, thinkingOverride };
+	}
+
+	const lowerSpec = modelSpec.toLowerCase();
+
+	const exactIdMatch =
+		available.find((m) => m.id.toLowerCase() === lowerSpec) ??
+		allModels.find((m) => m.id.toLowerCase() === lowerSpec);
+	if (exactIdMatch) return { model: exactIdMatch, thinkingOverride };
+
+	const substringMatch = available.find(
+		(m) =>
+			m.id.toLowerCase().includes(lowerSpec) ||
+			`${m.provider}/${m.id}`.toLowerCase().includes(lowerSpec),
+	);
+	if (substringMatch) return { model: substringMatch, thinkingOverride };
+
+	return undefined;
+}
+
+function isFastModelId(id: string): boolean {
+	const lower = id.toLowerCase();
+	return (
+		lower.includes("haiku") ||
+		lower.includes("flash") ||
+		lower.includes("mini") ||
+		lower.includes("nano") ||
+		lower.includes("lite") ||
+		lower.includes("fast")
+	);
+}
+
+async function resolveFirstAvailableCandidate(
+	ctx: ExtensionContext,
+	candidates: string[],
+): Promise<{ modelId: string; thinkingOverride?: ThinkingLevel } | undefined> {
+	for (const candidate of candidates) {
+		const found = findCandidateModel(ctx, candidate);
+		if (!found) continue;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(found.model);
+		if (!auth.ok) continue;
+		return {
+			modelId: `${found.model.provider}/${found.model.id}`,
+			thinkingOverride: found.thinkingOverride,
+		};
+	}
+	return undefined;
+}
+
+async function resolveAgentExecutionConfig(
+	agent: AgentConfig,
+	ctx: ExtensionContext,
+	dispatchDefaults: DispatchDefaults,
+): Promise<{ model?: string; thinkingLevel?: ThinkingLevel }> {
+	const projectSettings = readJsonSettings(path.join(ctx.cwd, ".pi", "settings.json"));
+	const globalSettings = readJsonSettings(path.join(getAgentDir(), "settings.json"));
+
+	const rawModel = agent.model?.trim();
+	const isFastAlias =
+		rawModel === "fast" ||
+		rawModel === "explore" ||
+		rawModel === "haiku" ||
+		(!rawModel && agent.name === "scout");
+
+	// Check per-agent model overrides in settings.json first
+	const configuredAgentCandidates = [
+		...parseModelCandidates(projectSettings?.subagent?.models?.[agent.name]),
+		...parseModelCandidates(globalSettings?.subagent?.models?.[agent.name]),
+	];
+	if (configuredAgentCandidates.length > 0) {
+		const resolved = await resolveFirstAvailableCandidate(ctx, configuredAgentCandidates);
+		if (resolved) {
+			return {
+				model: resolved.modelId,
+				thinkingLevel: agent.thinking ?? resolved.thinkingOverride ?? (agent.name === "scout" ? "off" : dispatchDefaults.thinkingLevel),
+			};
+		}
+	}
+
+	// If explicit model is set in agent frontmatter (and not a "fast" alias), try resolving it first
+	if (rawModel && !isFastAlias) {
+		const resolved = await resolveFirstAvailableCandidate(ctx, [rawModel]);
+		if (resolved) {
+			return {
+				model: resolved.modelId,
+				thinkingLevel: agent.thinking ?? resolved.thinkingOverride,
+			};
+		}
+		// If the hardcoded frontmatter model isn't available (e.g. `claude-haiku-4-5` on a custom provider),
+		// fall through to fast model resolution if it looks like a fast model or is scout
+		if (!isFastModelId(rawModel) && agent.name !== "scout") {
+			return {
+				model: dispatchDefaults.model,
+				thinkingLevel: agent.thinking ?? dispatchDefaults.thinkingLevel,
+			};
+		}
+	}
+
+	if (isFastAlias || (rawModel && isFastModelId(rawModel)) || agent.name === "scout") {
+		const fastCandidates = [
+			...parseModelCandidates(
+				process.env.PI_FAST_MODEL ??
+					process.env.PI_SCOUT_MODEL ??
+					process.env.PI_EXPLORE_MODEL ??
+					process.env.PI_COMPACTION_MODEL,
+			),
+			...parseModelCandidates(
+				projectSettings?.fast?.model ??
+					projectSettings?.fastModel ??
+					projectSettings?.subagent?.scoutModel ??
+					projectSettings?.compaction?.model ??
+					projectSettings?.compactionModel,
+			),
+			...parseModelCandidates(
+				globalSettings?.fast?.model ??
+					globalSettings?.fastModel ??
+					globalSettings?.subagent?.scoutModel ??
+					globalSettings?.compaction?.model ??
+					globalSettings?.compactionModel,
+			),
+		];
+
+		const fastThinking =
+			agent.thinking ??
+			parseThinkingLevel(
+				process.env.PI_FAST_THINKING ??
+					projectSettings?.fast?.thinkingLevel ??
+					projectSettings?.fastThinkingLevel ??
+					globalSettings?.fast?.thinkingLevel ??
+					globalSettings?.fastThinkingLevel,
+			) ??
+			"off";
+
+		const resolvedFast = await resolveFirstAvailableCandidate(ctx, fastCandidates);
+		if (resolvedFast) {
+			return {
+				model: resolvedFast.modelId,
+				thinkingLevel: resolvedFast.thinkingOverride ?? fastThinking,
+			};
+		}
+
+		// Auto-detect a fast model from available models (prefer current provider first)
+		const available = ctx.modelRegistry.getAvailable();
+		const activeProvider = ctx.model?.provider;
+		const sortedFast = [
+			...available.filter((m) => activeProvider && m.provider === activeProvider && isFastModelId(m.id)),
+			...available.filter((m) => (!activeProvider || m.provider !== activeProvider) && isFastModelId(m.id)),
+		];
+		for (const candidate of sortedFast) {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(candidate);
+			if (auth.ok) {
+				return {
+					model: `${candidate.provider}/${candidate.id}`,
+					thinkingLevel: agent.thinking ?? "off",
+				};
+			}
+		}
+
+		return {
+			model: dispatchDefaults.model,
+			thinkingLevel: agent.thinking ?? "off",
+		};
+	}
+
+	return {
+		model: dispatchDefaults.model,
+		thinkingLevel: agent.thinking ?? dispatchDefaults.thinkingLevel,
+	};
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -265,6 +529,7 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	ctx: ExtensionContext;
 }
 
 async function runSingleAgent(
@@ -295,14 +560,32 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	const inheritsDispatchConfig = !agent.model;
-	const model = agent.model ?? dispatchDefaults.model;
+	const resolvedExec = await resolveAgentExecutionConfig(agent, dispatchDefaults.ctx, dispatchDefaults);
+	const model = resolvedExec.model;
+	const thinkingLevel = resolvedExec.thinkingLevel;
+
+	const args: string[] = [
+		"--mode",
+		"json",
+		"-p",
+		"--no-session",
+		"--no-themes",
+		"--no-prompt-templates",
+		"--no-skills",
+	];
 	if (model) args.push("--model", model);
-	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
-		args.push("--thinking", dispatchDefaults.thinkingLevel);
+	if (thinkingLevel) {
+		args.push("--thinking", thinkingLevel);
 	}
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (agent.tools && agent.tools.length > 0) {
+		args.push("--tools", agent.tools.join(","));
+		if (agent.tools.every((t) => BUILTIN_TOOLS.has(t))) {
+			args.push("--no-extensions", "--no-mcp");
+		}
+	}
+	if (agent.omitContextFiles) {
+		args.push("--no-context-files");
+	}
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -476,6 +759,13 @@ export default function (pi: ExtensionAPI) {
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
+		promptSnippet:
+			"Delegate codebase exploration (scout), planning (planner), review (reviewer), or isolated tasks (worker) to subagents with isolated context",
+		promptGuidelines: [
+			"When exploring an unfamiliar codebase, tracing call chains across multiple files, or locating where a feature is implemented without knowing the exact file path, delegate to `subagent` with `agent: \"scout\"` (specify thoroughness: quick, medium, or thorough) instead of reading many files into the main context.",
+			"When investigating 2+ independent areas or modules, launch parallel `scout` subagents in a single call (`tasks: [...]`).",
+			"Do NOT spawn a subagent for trivial lookups when you already know the target file path or only need 1-2 quick `grep`/`read` calls—use direct tools when delegation overhead exceeds the work.",
+		],
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -483,6 +773,7 @@ export default function (pi: ExtensionAPI) {
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 				thinkingLevel: ctx.thinkingLevel,
+				ctx,
 			};
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;

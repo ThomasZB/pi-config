@@ -25,6 +25,11 @@ import { Type } from "typebox";
 
 type MemoryScope = "project" | "global";
 
+const MAX_MEMORY_LINES = 200;
+const WARN_MEMORY_LINES = 160;
+const MAX_MEMORY_BYTES = 25 * 1024;
+const WARN_MEMORY_BYTES = 20 * 1024;
+
 interface MemoryDetails {
 	action: "list" | "add" | "remove" | "replace";
 	scope: MemoryScope;
@@ -71,6 +76,37 @@ function readMemoryFile(filePath: string): string {
 	}
 }
 
+function truncateMemoryForPrompt(content: string): string {
+	if (!content) return "";
+	const lines = content.split("\n");
+	const byteLength = Buffer.byteLength(content, "utf-8");
+	if (lines.length <= MAX_MEMORY_LINES && byteLength <= MAX_MEMORY_BYTES) {
+		return content;
+	}
+
+	const keptLines = lines.slice(0, MAX_MEMORY_LINES);
+	let truncated = keptLines.join("\n");
+	while (Buffer.byteLength(truncated, "utf-8") > MAX_MEMORY_BYTES && keptLines.length > 1) {
+		keptLines.pop();
+		truncated = keptLines.join("\n");
+	}
+	return `${truncated}\n\n<!-- ⚠️ MEMORY.md exceeded ${MAX_MEMORY_LINES} lines / 25KB; entries past this limit were omitted. Use memory(action: "replace") to merge or remove stale entries. -->`;
+}
+
+function getMemoryLimitNotice(content: string): string {
+	if (!content) return "";
+	const lineCount = content.split("\n").length;
+	const byteLength = Buffer.byteLength(content, "utf-8");
+
+	if (lineCount > MAX_MEMORY_LINES || byteLength > MAX_MEMORY_BYTES) {
+		return `\n⚠️ MEMORY.md is ${lineCount} lines (${(byteLength / 1024).toFixed(1)}KB), exceeding the ${MAX_MEMORY_LINES}-line / 25KB startup load limit. Everything past the limit is dropped at session start. Please rewrite and condense the index using memory(action: "replace").`;
+	}
+	if (lineCount >= WARN_MEMORY_LINES || byteLength >= WARN_MEMORY_BYTES) {
+		return `\nNote: MEMORY.md is nearing the startup limit (${lineCount}/${MAX_MEMORY_LINES} lines). Keep one line per entry and merge or drop stale notes when convenient.`;
+	}
+	return "";
+}
+
 async function writeMemoryFile(filePath: string, content: string): Promise<void> {
 	await withFileMutationQueue(filePath, async () => {
 		await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
@@ -80,7 +116,7 @@ async function writeMemoryFile(filePath: string, content: string): Promise<void>
 }
 
 async function appendMemoryBullet(filePath: string, note: string, scope: MemoryScope): Promise<string> {
-	const cleanNote = note.trim().replace(/^-\s+/, "");
+	const cleanNote = note.trim().replace(/^-\s+/, "").replace(/\s*\n+\s*/g, " ");
 	let updated = "";
 	await withFileMutationQueue(filePath, async () => {
 		await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
@@ -89,6 +125,14 @@ async function appendMemoryBullet(filePath: string, note: string, scope: MemoryS
 		if (!existing) {
 			updated = `${header}\n\n- ${cleanNote}\n`;
 		} else {
+			const normalizedTarget = `- ${cleanNote}`.toLowerCase();
+			const alreadyExists = existing
+				.split("\n")
+				.some((line) => line.trim().toLowerCase() === normalizedTarget);
+			if (alreadyExists) {
+				updated = `${existing}\n`;
+				return;
+			}
 			updated = `${existing}\n- ${cleanNote}\n`;
 		}
 		await fs.promises.writeFile(filePath, updated, "utf-8");
@@ -97,13 +141,13 @@ async function appendMemoryBullet(filePath: string, note: string, scope: MemoryS
 }
 
 export default function memoryExtension(pi: ExtensionAPI) {
-	// Inject project and global memory into structured system prompt sections
+	// Inject project and global memory into structured system prompt sections (capped at first 200 lines / 25KB)
 	pi.on("before_agent_start", async (event, ctx) => {
 		const globalPath = getMemoryFilePath(ctx.cwd, "global");
 		const projectPath = getMemoryFilePath(ctx.cwd, "project");
 
-		const globalMem = readMemoryFile(globalPath);
-		const projectMem = readMemoryFile(projectPath);
+		const globalMem = truncateMemoryForPrompt(readMemoryFile(globalPath));
+		const projectMem = truncateMemoryForPrompt(readMemoryFile(projectPath));
 
 		const parts: string[] = [];
 		if (globalMem) {
@@ -132,8 +176,9 @@ export default function memoryExtension(pi: ExtensionAPI) {
 			"Read or update persistent project (.pi/MEMORY.md) or global (~/.pi/agent/MEMORY.md) memory across sessions.",
 		promptSnippet: "Save or update persistent project/global memories across sessions",
 		promptGuidelines: [
-			"Use the `memory` tool when the user asks you to remember a preference, convention, command, or architectural decision across sessions.",
-			"Prefer `scope: \"project\"` for repository-specific knowledge and `scope: \"global\"` for user-wide preferences.",
+			"Use the `memory` tool when the user explicitly asks you to remember something, OR proactively (auto-memory) when you learn: (1) user corrections/feedback on your approach or style so you don't repeat mistakes, (2) non-obvious project build/test commands, architectural constraints, or gotchas not obvious from the code, or (3) recurring user preferences.",
+			"Do NOT save generic module summaries, file trees, or facts easily derived by reading the code or git history.",
+			"Prefer `scope: \"project\"` for repository-specific knowledge and `scope: \"global\"` for user-wide preferences. Keep each entry to one concise line (only the first 200 lines / 25KB of MEMORY.md load at session start).",
 		],
 		parameters: MemoryParams,
 
@@ -168,11 +213,12 @@ export default function memoryExtension(pi: ExtensionAPI) {
 						};
 					}
 					const updated = await appendMemoryBullet(filePath, params.content, scope);
+					const limitNotice = getMemoryLimitNotice(updated);
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Saved to ${scope} memory (${filePath}):\n- ${params.content.trim().replace(/^-\s+/, "")}`,
+								text: `Saved to ${scope} memory (${filePath}):\n- ${params.content.trim().replace(/^-\s+/, "")}${limitNotice}`,
 							},
 						],
 						details: {
@@ -239,12 +285,13 @@ export default function memoryExtension(pi: ExtensionAPI) {
 				case "replace": {
 					const newContent = params.content ?? "";
 					await writeMemoryFile(filePath, newContent);
+					const limitNotice = getMemoryLimitNotice(newContent.trim());
 					return {
 						content: [
 							{
 								type: "text",
 								text: newContent.trim()
-									? `Updated ${scope} memory (${filePath}).`
+									? `Updated ${scope} memory (${filePath}).${limitNotice}`
 									: `Cleared ${scope} memory (${filePath}).`,
 							},
 						],

@@ -4,15 +4,20 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
+
+const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
 	model?: string;
+	thinking?: ThinkingLevel;
+	omitContextFiles?: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -36,6 +41,10 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	thinking?: unknown;
+	effort?: unknown;
+	omitContextFiles?: unknown;
+	omitClaudeMd?: unknown;
 };
 
 /**
@@ -57,6 +66,13 @@ function parseToolList(value: unknown): string[] | undefined {
 		.map((t) => t.trim())
 		.filter(Boolean);
 	return tools.length > 0 ? tools : undefined;
+}
+
+function parseThinking(value: unknown): ThinkingLevel | undefined {
+	if (typeof value === "boolean" && value === false) return "off";
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim().toLowerCase() as ThinkingLevel;
+	return VALID_THINKING_LEVELS.includes(normalized) ? normalized : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -91,11 +107,19 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
+		const omitContext =
+			frontmatter.omitContextFiles === true ||
+			frontmatter.omitContextFiles === "true" ||
+			frontmatter.omitClaudeMd === true ||
+			frontmatter.omitClaudeMd === "true";
+
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
-			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			model: typeof frontmatter.model === "string" ? frontmatter.model.trim() : undefined,
+			thinking: parseThinking(frontmatter.thinking ?? frontmatter.effort),
+			omitContextFiles: omitContext ? true : undefined,
 			systemPrompt: body,
 			source,
 			filePath,
