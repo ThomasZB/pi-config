@@ -1048,11 +1048,44 @@ function formatSingleToolLine(
 			resultDesc = fg("muted", `${lines.length} items`);
 		}
 	} else if (toolName === "codemode") {
-		callDesc = `${fg("warning", "⚡")} ${fg("toolTitle", bold("codemode"))} ${fg("dim", "JS sandbox")}`;
+		const codeStr = String(args?.code ?? "");
+		const innerCounts = new Map<string, number>();
+		for (const m of codeStr.matchAll(/\btools\.([a-zA-Z0-9_]+)\s*\(/g)) {
+			const name = m[1]!;
+			innerCounts.set(name, (innerCounts.get(name) ?? 0) + 1);
+		}
+		const innerSummary =
+			innerCounts.size > 0
+				? Array.from(innerCounts.entries())
+						.map(([k, v]) => (v > 1 ? `${k} ×${v}` : k))
+						.join(", ")
+				: "JS sandbox";
+		callDesc = `${fg("warning", "⚡")} ${fg("toolTitle", bold("codemode"))} ${fg("accent", `(${innerSummary})`)}`;
 		if (isPartial) {
 			resultDesc = `${breatheText("Executing script", COLOR_AMBER, COLOR_CYAN, 3.6)} ${renderBreathingWave(COLOR_AMBER, COLOR_CYAN, ["•", "•", "•"])}`;
 		} else if (isError) {
 			resultDesc = fg("error", "Script failed");
+		} else {
+			const out = extractText(result).trim();
+			const lines = out ? out.split("\n") : [];
+			resultDesc = fg("muted", `${lines.length} lines`);
+		}
+	} else if (toolName === "session_recall") {
+		const action = String(args?.action ?? "recall");
+		const target = args?.query
+			? `"${truncateToWidth(String(args.query), 32, "…")}"`
+			: args?.seq !== undefined
+				? `#${args.seq}`
+				: args?.start_seq !== undefined
+					? `#${args.start_seq}..#${args.end_seq ?? ""}`
+					: args?.session_id
+						? String(args.session_id).slice(0, 12)
+						: String(args?.scope ?? "");
+		callDesc = `${fg("accent", "📚")} ${fg("toolTitle", bold("session_recall"))} ${fg("accent", action)}${target ? ` ${fg("muted", target)}` : ""}`;
+		if (isPartial) {
+			resultDesc = `${breatheText("Recalling", COLOR_CYAN, COLOR_PURPLE, 3.6)} ${renderBreathingWave(COLOR_CYAN, COLOR_PURPLE, ["•", "•", "•"])}`;
+		} else if (isError) {
+			resultDesc = fg("error", "Failed");
 		} else {
 			const out = extractText(result).trim();
 			const lines = out ? out.split("\n") : [];

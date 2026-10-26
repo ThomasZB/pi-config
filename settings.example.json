@@ -4,5 +4,12 @@
   "defaultTools": ["+grep", "+find", "+ls", "+codemode"],
   "web": {
     "deepseekApiKeyEnv": "DEEPSEEK_API_KEY"
+  },
+  "microCompaction": {
+    "enabled": true,
+    "cacheTtlMinutes": 6,
+    "keepRecentTurns": 4,
+    "minToolResultChars": 4000,
+    "clearAtLeastTokens": 30000
   }
 }

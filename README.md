@@ -52,6 +52,7 @@
 | `plan-mode/` | 只读探索规划模式（`/plan`、`Ctrl+Alt+P`、`/plan-todos`） |
 | `web.ts` | 原生联网搜索与网页抓取工具（`web_search` + `web_fetch`，基于 DeepSeek Search/Fetch API，支持 Tavily / 直连自动兜底） |
 | `compaction-model.ts` | 独立配置上下文压缩与分支摘要模型（`/compact-model`，支持指定 Haiku/Flash 及思考等级，失败自动回退） |
+| `session-recall.ts` | 压缩前历史回溯 + 同项目跨会话记忆召回 + **Cache-Aware 微压缩**（`session_recall` + `/recall`），默认空闲 ≥ 6 分钟趁缓存过期自动为旧大工具输出瘦身，并支持随时按 `#seq` 无损翻查原文 |
 | `subagent/` + `agents/*.md` | 多子智能体委派（`scout`、`planner`、`reviewer`、`worker`，自动继承当前默认模型） |
 | `questionnaire.ts` | 结构化多选/Tab 交互提问工具 |
 | `todo.ts` | 会话内任务看板工具与 `/todos` 命令 |
@@ -109,6 +110,7 @@ pi install git+https://github.com/ThomasZB/pi-config.git
 | :--- | :--- |
 | `/reload` | 热重载所有扩展、主题、智能体与配置（并恢复完整历史视图） |
 | `/compact-model` | 交互式选择或配置独立的上下文压缩模型（如 Haiku / Flash） |
+| `/recall` | 查看回溯与微压缩状态（`/recall ttl <分钟>` 设置缓存过期微压缩时间，默认 6 分钟；`/recall compact` 立即手动瘦身旧工具输出） |
 | `/fold` (`Ctrl+Alt+F`) | 一键展开/折叠输入框内的粘贴日志块，或展开/折叠对话中的多行用户输入 |
 | `/history` | 切换「保留 Compact 前完整历史记录」vs「仅显示压缩后精简视图」 |
 | `/compact-tools` | 切换「Claude 风格连续命令折叠 + 呼吸灯视图」vs「默认输出」 |
