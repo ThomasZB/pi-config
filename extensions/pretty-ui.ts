@@ -44,6 +44,7 @@ import {
 	type ReadToolDetails,
 	type Theme,
 	ToolExecutionComponent,
+	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import {
 	type Component,
@@ -53,6 +54,7 @@ import {
 	type MouseEvent,
 	ScrollView,
 	Spacer,
+	sliceByColumn,
 	Text,
 	type TUI,
 	truncateToWidth,
@@ -69,6 +71,7 @@ interface GlobalPrettyState {
 	theme?: Theme;
 	tui?: TUI;
 	lastInteractiveMode?: any;
+	activeEditor?: ArrowPromptEditor;
 	keepFullHistory?: boolean;
 	hoverTarget: any;
 	hoverSubRow: number;
@@ -1525,15 +1528,205 @@ function installGroupedToolRenderer(): void {
 }
 
 // ============================================================================
-// 4. Arrow Prompt Editor (`❯ `) with Breathing Border & Hover Reaction
+// 4. Arrow Prompt Editor (`❯ `) with Paste/Input Zoom & Breathing Border
 // ============================================================================
+const PASTE_COLLAPSE_MIN_LINES = 5;
+const PASTE_COLLAPSE_MIN_CHARS = 400;
+const EDITOR_PASTE_MARKER_RE = /\[paste #(\d+)(?: (\+\d+ lines|\d+ chars))?\]/g;
+const EDITOR_PASTE_MARKER_SINGLE_RE = /^\[paste #(\d+)(?: (\+\d+ lines|\d+ chars))?\]$/;
+
 class ArrowPromptEditor extends CustomEditor {
 	private getAppTheme: () => Theme;
+	private lastExpandedPastes: string[] = [];
+	private suppressSmartInsert = false;
 
 	constructor(tui: TUI, editorTheme: EditorTheme, keybindings: KeybindingsManager, getAppTheme: () => Theme) {
 		super(tui, editorTheme, keybindings, { paddingX: 0, embedWorkingStatus: true });
 		this.getAppTheme = getAppTheme;
 		setActiveTui(tui);
+		getGlobalState().activeEditor = this;
+	}
+
+	hasCollapsedPasteMarkers(): boolean {
+		const pastes: Map<number, string> | undefined = (this as any).pastes;
+		if (!pastes || pastes.size === 0) return false;
+		const text = this.getText();
+		if (!text.includes("[paste #")) return false;
+		for (const m of text.matchAll(EDITOR_PASTE_MARKER_RE)) {
+			const id = Number.parseInt(m[1]!, 10);
+			if (pastes.has(id)) return true;
+		}
+		return false;
+	}
+
+	isMultiLineCollapsible(): boolean {
+		if (this.hasCollapsedPasteMarkers()) return false;
+		const lines: string[] = (this as any).state?.lines ?? [];
+		return lines.length >= 4 || this.getText().length > 300;
+	}
+
+	canToggleInputFold(): boolean {
+		return this.hasCollapsedPasteMarkers() || this.isMultiLineCollapsible();
+	}
+
+	getCollapsedPasteStats(): { count: number; totalLines: number; totalChars: number } {
+		const pastes: Map<number, string> | undefined = (this as any).pastes;
+		if (!pastes || pastes.size === 0) return { count: 0, totalLines: 0, totalChars: 0 };
+		const text = this.getText();
+		let count = 0;
+		let totalLines = 0;
+		let totalChars = 0;
+		for (const m of text.matchAll(EDITOR_PASTE_MARKER_RE)) {
+			const id = Number.parseInt(m[1]!, 10);
+			const content = pastes.get(id);
+			if (content !== undefined) {
+				count++;
+				totalLines += content.split("\n").length;
+				totalChars += content.length;
+			}
+		}
+		return { count, totalLines, totalChars };
+	}
+
+	toggleInputFold(): "expanded" | "collapsed" | false {
+		const pastes: Map<number, string> | undefined = (this as any).pastes;
+		const state = (this as any).state as { lines: string[]; cursorLine: number; cursorCol: number } | undefined;
+		if (!state || !pastes) return false;
+
+		if (this.hasCollapsedPasteMarkers()) {
+			(this as any).pushUndoSnapshot?.();
+			const rawText = state.lines.join("\n");
+			const savedBlocks: string[] = [];
+			for (const m of rawText.matchAll(EDITOR_PASTE_MARKER_RE)) {
+				const id = Number.parseInt(m[1]!, 10);
+				const content = pastes.get(id);
+				if (content !== undefined) {
+					savedBlocks.push(content);
+				}
+			}
+			this.lastExpandedPastes = savedBlocks;
+			const expandedText: string = (this as any).expandPasteMarkers(rawText);
+			pastes.clear();
+			(this as any).pasteCounter = 0;
+			const newLines = expandedText.split("\n");
+			state.lines = newLines.length > 0 ? newLines : [""];
+			state.cursorLine = Math.min(state.cursorLine, state.lines.length - 1);
+			(this as any).setCursorCol?.(
+				Math.min(state.cursorCol, (state.lines[state.cursorLine] ?? "").length),
+			);
+			this.onChange?.(this.getText());
+			(this as any).tui?.requestRender();
+			return "expanded";
+		}
+
+		const currentText = state.lines.join("\n");
+		if (state.lines.length <= 1 && currentText.length <= 200) {
+			return false;
+		}
+
+		(this as any).pushUndoSnapshot?.();
+		pastes.clear();
+		(this as any).pasteCounter = 0;
+
+		let foldedText = currentText;
+		let matchedAny = false;
+		for (const block of this.lastExpandedPastes) {
+			if ((block.includes("\n") || block.length > 200) && foldedText.includes(block)) {
+				(this as any).pasteCounter++;
+				const pasteId: number = (this as any).pasteCounter;
+				pastes.set(pasteId, block);
+				const blockLines = block.split("\n").length;
+				const marker =
+					blockLines > 1
+						? `[paste #${pasteId} +${blockLines} lines]`
+						: `[paste #${pasteId} ${block.length} chars]`;
+				foldedText = foldedText.replace(block, () => marker);
+				matchedAny = true;
+			}
+		}
+
+		if (!matchedAny) {
+			(this as any).pasteCounter = 1;
+			pastes.set(1, currentText);
+			const totalLines = state.lines.length;
+			const marker =
+				totalLines > 1
+					? `[paste #1 +${totalLines} lines]`
+					: `[paste #1 ${currentText.length} chars]`;
+			foldedText = marker;
+		}
+
+		const foldedLines = foldedText.split("\n");
+		state.lines = foldedLines.length > 0 ? foldedLines : [""];
+		state.cursorLine = Math.min(state.cursorLine, state.lines.length - 1);
+		(this as any).setCursorCol?.((state.lines[state.cursorLine] ?? "").length);
+		(this as any).scrollOffset = 0;
+		this.onChange?.(this.getText());
+		(this as any).tui?.requestRender();
+		return "collapsed";
+	}
+
+	override handlePaste(pastedText: string): void {
+		const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
+			const cp = Number(code);
+			if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
+			if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
+			return match;
+		});
+		const cleanText: string = (this as any).normalizeText
+			? (this as any).normalizeText(decodedText)
+			: decodedText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\t/g, "    ");
+		let filteredText = cleanText
+			.split("")
+			.filter((char) => char === "\n" || char.charCodeAt(0) >= 32)
+			.join("");
+
+		const pastedLines = filteredText.split("\n");
+		const totalChars = filteredText.length;
+
+		if (pastedLines.length > PASTE_COLLAPSE_MIN_LINES || totalChars > PASTE_COLLAPSE_MIN_CHARS) {
+			(this as any).cancelAutocomplete?.();
+			(this as any).exitHistoryBrowsing?.();
+			(this as any).lastAction = null;
+			(this as any).pushUndoSnapshot?.();
+
+			if (/^[/~.]/.test(filteredText)) {
+				const state = (this as any).state;
+				const currentLine = state?.lines?.[state.cursorLine] || "";
+				const charBeforeCursor = state?.cursorCol > 0 ? currentLine[state.cursorCol - 1] : "";
+				if (charBeforeCursor && /\w/.test(charBeforeCursor)) {
+					filteredText = ` ${filteredText}`;
+				}
+			}
+
+			(this as any).pasteCounter = ((this as any).pasteCounter ?? 0) + 1;
+			const pasteId: number = (this as any).pasteCounter;
+			(this as any).pastes?.set(pasteId, filteredText);
+			const marker =
+				pastedLines.length > 1
+					? `[paste #${pasteId} +${pastedLines.length} lines]`
+					: `[paste #${pasteId} ${totalChars} chars]`;
+			this.suppressSmartInsert = true;
+			try {
+				(this as any).insertTextAtCursorInternal(marker);
+			} finally {
+				this.suppressSmartInsert = false;
+			}
+			return;
+		}
+
+		super.handlePaste(pastedText);
+	}
+
+	override insertTextAtCursor(text: string): void {
+		if (!this.suppressSmartInsert && text) {
+			const lineCount = text.split(/\r?\n/).length;
+			if (lineCount > PASTE_COLLAPSE_MIN_LINES || text.length > PASTE_COLLAPSE_MIN_CHARS) {
+				this.handlePaste(text);
+				return;
+			}
+		}
+		super.insertTextAtCursor(text);
 	}
 
 	private getPromptPrefix(hovered: boolean, busy: boolean): string {
@@ -1552,6 +1745,42 @@ class ArrowPromptEditor extends CustomEditor {
 			return rgbFg(COLOR_CYAN, bold("✦❯"));
 		}
 		return thm.bold(thm.fg("accent", "❯ "));
+	}
+
+	override renderTopBorder(width: number, hiddenLineCount: number): string {
+		const baseBorder = super.renderTopBorder(width, hiddenLineCount);
+		if (!this.canToggleInputFold() || width < 28) {
+			return baseBorder;
+		}
+
+		const st = getGlobalState();
+		const borderHovered = isHovered(this) && st.hoverSubRow === 0;
+		let badge = "";
+
+		if (this.hasCollapsedPasteMarkers()) {
+			const stats = this.getCollapsedPasteStats();
+			const info = stats.totalLines > 1 ? `${stats.totalLines} 行` : `${stats.totalChars} 字符`;
+			badge = borderHovered
+				? ` ${rgbFg(COLOR_CYAN, bold(`[ ✦ 点击展开粘贴内容 (${info} · Ctrl+Alt+F) ]`))} `
+				: ` ${rgbFg(COLOR_CYAN, `▸ 展开粘贴 (${info})`)} ${fg("dim", "[点击 / Ctrl+Alt+F]")} `;
+		} else {
+			const lineCount: number = (this as any).state?.lines?.length ?? 1;
+			badge = borderHovered
+				? ` ${rgbFg(COLOR_AMBER, bold(`[ ✦ 点击折叠输入 (${lineCount} 行 · Ctrl+Alt+F) ]`))} `
+				: ` ${rgbFg(COLOR_AMBER, `▾ 折叠输入 (${lineCount} 行)`)} ${fg("dim", "[点击 / Ctrl+Alt+F]")} `;
+		}
+
+		const tail = this.borderColor("──");
+		const rightSegment = `${badge}${tail}`;
+		const rightWidth = visibleWidth(rightSegment);
+		if (width <= rightWidth + 10) {
+			return baseBorder;
+		}
+
+		const leftWidth = width - rightWidth;
+		const leftPart = sliceByColumn(baseBorder, 0, leftWidth, true);
+		const padCount = Math.max(0, leftWidth - visibleWidth(leftPart));
+		return `${leftPart}${this.borderColor("─".repeat(padCount))}${rightSegment}`;
 	}
 
 	override render(width: number): string[] {
@@ -1595,9 +1824,18 @@ class ArrowPromptEditor extends CustomEditor {
 		const out: string[] = new Array(lines.length);
 		out[0] = `${borderPrefix}${lines[0]}`;
 
+		const hasPastes = ((this as any).pastes?.size ?? 0) > 0;
 		for (let i = 1; i < bottomBorderIdx; i++) {
 			const prefix = i === 1 ? firstPrompt : contPrompt;
-			out[i] = `${prefix}${lines[i]}`;
+			let lineStr = lines[i]!;
+			if (hasPastes && lineStr.includes("[paste #")) {
+				const lineHovered = hovered && st.hoverSubRow === i;
+				lineStr = lineStr.replace(
+					/(?<!\x1b\[7m)(\[paste #\d+(?: (?:\+\d+ lines|\d+ chars))?\])/g,
+					(m) => (lineHovered ? rgbFg(COLOR_AMBER, bold(m)) : rgbFg(COLOR_CYAN, bold(m))),
+				);
+			}
+			out[i] = `${prefix}${lineStr}`;
 		}
 
 		out[bottomBorderIdx] = `${borderPrefix}${lines[bottomBorderIdx]}`;
@@ -1609,22 +1847,220 @@ class ArrowPromptEditor extends CustomEditor {
 		return out;
 	}
 
+	private isClickOnPasteMarker(innerX: number, y: number): boolean {
+		if (!this.hasCollapsedPasteMarkers()) return false;
+		const visibleLineCount: number = (this as any).renderedVisibleLineCount ?? 0;
+		if (y <= 0 || y > visibleLineCount) return false;
+		const visualLines: Array<{ logicalLine: number; startCol: number; length: number }> | undefined =
+			(this as any).buildVisualLineMap?.((this as any).lastWidth);
+		const scrollOffset: number = (this as any).scrollOffset ?? 0;
+		const visualLine = visualLines?.[scrollOffset + y - 1];
+		if (!visualLine) return false;
+		const state = (this as any).state as { lines: string[] } | undefined;
+		const logicalLine = state?.lines?.[visualLine.logicalLine] ?? "";
+		const chunk = logicalLine.slice(visualLine.startCol, visualLine.startCol + visualLine.length);
+		if (!chunk.includes("[paste #")) return false;
+
+		const maxPadding = Math.max(0, Math.floor(((this as any).lastWidth - 1) / 2));
+		const paddingX = Math.min((this as any).paddingX ?? 0, maxPadding);
+		const targetColumn = Math.max(0, innerX - paddingX);
+
+		let visibleColumn = 0;
+		const segments: Iterable<{ segment: string; index: number }> =
+			(this as any).segment?.(chunk, "grapheme") ?? [];
+		for (const grapheme of segments) {
+			const segWidth = visibleWidth(grapheme.segment);
+			const nextColumn = visibleColumn + segWidth;
+			if (targetColumn >= visibleColumn && targetColumn < nextColumn) {
+				return EDITOR_PASTE_MARKER_SINGLE_RE.test(grapheme.segment);
+			}
+			visibleColumn = nextColumn;
+		}
+		return false;
+	}
+
 	override handleMouse(event: MouseEvent) {
+		const innerX = Math.max(0, event.x - PROMPT_PREFIX_WIDTH);
+		const innerWidth = Math.max(4, event.width - PROMPT_PREFIX_WIDTH);
+
 		if (event.type === "move") {
 			const changed = claimHover(this, event.y);
 			const sub = super.handleMouse({
 				...event,
-				x: Math.max(0, event.x - PROMPT_PREFIX_WIDTH),
-				width: Math.max(4, event.width - PROMPT_PREFIX_WIDTH),
+				x: innerX,
+				width: innerWidth,
 			});
 			return sub ?? { handled: true, render: changed };
 		}
+
+		if (event.type === "click" && event.button === "left") {
+			if (event.y === 0 && this.canToggleInputFold()) {
+				this.toggleInputFold();
+				return { handled: true, render: true, focus: true };
+			}
+			if (this.isClickOnPasteMarker(innerX, event.y)) {
+				this.toggleInputFold();
+				return { handled: true, render: true, focus: true };
+			}
+		}
+
 		return super.handleMouse({
 			...event,
-			x: Math.max(0, event.x - PROMPT_PREFIX_WIDTH),
-			width: Math.max(4, event.width - PROMPT_PREFIX_WIDTH),
+			x: innerX,
+			width: innerWidth,
 		});
 	}
+}
+
+// ============================================================================
+// 5. Claude-Style Collapsible User Messages (Auto-Fold Large Pastes & Logs)
+// ============================================================================
+const ORIG_USER_RENDER_KEY = Symbol.for("pretty-ui:origUserRender");
+const ORIG_USER_MOUSE_KEY = Symbol.for("pretty-ui:origUserMouse");
+const USER_AUTO_COLLAPSE_LINES = 6;
+const USER_AUTO_COLLAPSE_CHARS = 450;
+const USER_PREVIEW_LINES = 3;
+const OSC133_END_PREFIX = "\x1b]133;B\x07\x1b]133;C\x07";
+
+function installCollapsibleUserMessageRenderer(): void {
+	const userProto = UserMessageComponent.prototype as any;
+	if (!userProto[ORIG_USER_RENDER_KEY]) {
+		userProto[ORIG_USER_RENDER_KEY] = userProto.render;
+	}
+	if (!userProto[ORIG_USER_MOUSE_KEY]) {
+		userProto[ORIG_USER_MOUSE_KEY] = userProto.handleMouse;
+	}
+
+	const origUserRender = userProto[ORIG_USER_RENDER_KEY];
+	const origUserMouse = userProto[ORIG_USER_MOUSE_KEY];
+
+	userProto.setExpanded = function (expanded: boolean) {
+		this.__userExpanded = expanded ? true : undefined;
+		getGlobalState().tui?.requestRender();
+	};
+
+	userProto.render = function (width: number): string[] {
+		const lines: string[] = origUserRender.call(this, width);
+		if (!compactToolsEnabled || lines.length < 3) {
+			return lines;
+		}
+
+		const contentLines = lines.slice(1, lines.length - 1);
+		const totalLines = contentLines.length;
+		this.__lastTotalLines = totalLines;
+
+		const rawText = String(this.text ?? "");
+		const rawLineCount = rawText.split("\n").length;
+		const charCount = rawText.length;
+
+		const shouldAutoCollapse =
+			totalLines > USER_AUTO_COLLAPSE_LINES ||
+			rawLineCount > USER_AUTO_COLLAPSE_LINES ||
+			charCount > USER_AUTO_COLLAPSE_CHARS;
+		const isCollapsible = totalLines >= 2 || shouldAutoCollapse;
+		if (!isCollapsible) {
+			return lines;
+		}
+
+		const defaultExpanded = !shouldAutoCollapse;
+		const expanded: boolean = this.__userExpanded ?? defaultExpanded;
+		const hovered = isHovered(this);
+
+		const pad = " ".repeat(Math.max(1, this.outputPad ?? 1));
+		const maxInnerWidth = Math.max(10, width - visibleWidth(pad) * 2);
+		const styleWithUserBg = (innerText: string): string => {
+			const clipped = truncateToWidth(innerText, maxInnerWidth, "…");
+			const withMargins = `${pad}${clipped}${pad}`;
+			const vis = visibleWidth(withMargins);
+			const fill = " ".repeat(Math.max(0, width - vis));
+			const full = withMargins + fill;
+			const t = getActiveTheme();
+			if (t) {
+				try {
+					return t.bg("userMessageBg", full);
+				} catch {
+					// fall through
+				}
+			}
+			return full;
+		};
+
+		// 1. Collapsed state: show first preview lines + interactive fold summary bar
+		if (!expanded) {
+			const previewCount = totalLines > USER_PREVIEW_LINES ? USER_PREVIEW_LINES : 1;
+			const previewLines = contentLines.slice(0, previewCount);
+			const hiddenCount = Math.max(1, totalLines - previewCount);
+
+			const foldLine = hovered
+				? styleWithUserBg(
+						`${rgbFg(COLOR_CYAN, bold("▶"))} ${rgbFg(COLOR_PURPLE, bold(`📋 已折叠 ${hiddenCount} 行用户输入 (共 ${totalLines} 行 · ${charCount.toLocaleString()} 字符)`))}  ${rgbFg(COLOR_CYAN, bold("[ ✦ 点击展开完整内容 ]"))}`,
+					)
+				: styleWithUserBg(
+						`${fg("borderAccent", "▸")} ${fg("muted", `📋 已折叠 ${hiddenCount} 行用户输入`)} ${fg("dim", `(共 ${totalLines} 行 · ${charCount.toLocaleString()} 字符 · 点击或 Ctrl+O 展开)`)}`,
+					);
+
+			return [lines[0]!, ...previewLines, foldLine, lines[lines.length - 1]!];
+		}
+
+		// 2. Expanded state for large messages (or manually expanded messages)
+		if (shouldAutoCollapse || this.__userExpanded === true) {
+			const collapseBar = hovered
+				? styleWithUserBg(
+						`${rgbFg(COLOR_AMBER, bold("▼"))} ${rgbFg(COLOR_PURPLE, bold(`📋 完整用户输入 (共 ${totalLines} 行 · ${charCount.toLocaleString()} 字符)`))}  ${rgbFg(COLOR_AMBER, bold("[ ✦ 点击折叠收起 ]"))}`,
+					)
+				: styleWithUserBg(
+						`${fg("accent", "▾")} ${fg("dim", `📋 用户输入共 ${totalLines} 行 (${charCount.toLocaleString()} 字符 · 点击或 Ctrl+O 折叠收起)`)}`,
+					);
+
+			if (totalLines > 12) {
+				return [lines[0]!, collapseBar, ...contentLines, collapseBar, lines[lines.length - 1]!];
+			}
+			return [lines[0]!, ...contentLines, collapseBar, lines[lines.length - 1]!];
+		}
+
+		// 3. Medium multi-line message (2-6 lines) in default expanded state:
+		// Show hover hint inside the existing bottom padding line (0 layout height shift!)
+		if (hovered) {
+			const bottomHint =
+				OSC133_END_PREFIX +
+				styleWithUserBg(
+					`${rgbFg(COLOR_AMBER, bold("▾"))} ${rgbFg(COLOR_AMBER, bold(`[ ✦ 点击折叠此条输入 (共 ${totalLines} 行) ]`))}`,
+				);
+			return [...lines.slice(0, -1), bottomHint];
+		}
+
+		return lines;
+	};
+
+	userProto.handleMouse = function (event: MouseEvent) {
+		if (!compactToolsEnabled) {
+			return origUserMouse ? origUserMouse.call(this, event) : undefined;
+		}
+		if (event.type === "move") {
+			const changed = claimHover(this, 0);
+			return { handled: true, render: changed };
+		}
+		if (event.type === "click" && event.button === "left") {
+			const rawText = String(this.text ?? "");
+			const rawLineCount = rawText.split("\n").length;
+			const charCount = rawText.length;
+			const lastTotalLines = this.__lastTotalLines ?? rawLineCount;
+			const shouldAutoCollapse =
+				lastTotalLines > USER_AUTO_COLLAPSE_LINES ||
+				rawLineCount > USER_AUTO_COLLAPSE_LINES ||
+				charCount > USER_AUTO_COLLAPSE_CHARS;
+			const isCollapsible = lastTotalLines >= 2 || shouldAutoCollapse;
+			if (!isCollapsible) {
+				return origUserMouse ? origUserMouse.call(this, event) : undefined;
+			}
+			const defaultExpanded = !shouldAutoCollapse;
+			const currentExpanded = this.__userExpanded ?? defaultExpanded;
+			this.__userExpanded = !currentExpanded;
+			getGlobalState().tui?.requestRender();
+			return { handled: true, render: true };
+		}
+		return origUserMouse ? origUserMouse.call(this, event) : undefined;
+	};
 }
 
 // ============================================================================
@@ -1767,6 +2203,7 @@ export default function prettyUiExtension(pi: ExtensionAPI) {
 	installRichMarkdownRenderer();
 	installCompactThinkingRenderer();
 	installGroupedToolRenderer();
+	installCollapsibleUserMessageRenderer();
 	installFullHistoryPreserver();
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1935,6 +2372,69 @@ export default function prettyUiExtension(pi: ExtensionAPI) {
 					: "已切换：仅显示 Compact 之后的精简上下文",
 				"info",
 			);
+		},
+	});
+
+	const toggleFoldAction = (ctx: any) => {
+		const st = getGlobalState();
+		const editor = st.activeEditor;
+		if (editor && editor.canToggleInputFold()) {
+			const result = editor.toggleInputFold();
+			if (result === "expanded") {
+				ctx.ui.notify("已展开输入框内的粘贴内容（可编辑，再次按 Ctrl+Alt+F 或点击上边框可折叠）", "info");
+				return;
+			}
+			if (result === "collapsed") {
+				ctx.ui.notify("已将输入框多行内容折叠为 [paste] 胶囊（发送时会自动还原完整文本）", "info");
+				return;
+			}
+		}
+
+		const children: any[] = st.lastInteractiveMode?.chatContainer?.children ?? [];
+		const userComps = children.filter((c) => c instanceof UserMessageComponent);
+		if (userComps.length === 0) {
+			ctx.ui.notify("当前没有可折叠/展开的用户输入记录", "info");
+			return;
+		}
+
+		// Find collapsible user messages
+		const collapsible = userComps.filter((c: any) => {
+			const raw = String(c.text ?? "");
+			return (c.__lastTotalLines ?? raw.split("\n").length) >= 2 || raw.length > USER_AUTO_COLLAPSE_CHARS;
+		});
+		const targets = collapsible.length > 0 ? collapsible : userComps;
+		const anyCollapsed = targets.some((c: any) => {
+			const raw = String(c.text ?? "");
+			const total = c.__lastTotalLines ?? raw.split("\n").length;
+			const autoCollapse =
+				total > USER_AUTO_COLLAPSE_LINES ||
+				raw.split("\n").length > USER_AUTO_COLLAPSE_LINES ||
+				raw.length > USER_AUTO_COLLAPSE_CHARS;
+			const isExpanded = c.__userExpanded ?? !autoCollapse;
+			return !isExpanded;
+		});
+
+		for (const c of targets) {
+			(c as any).__userExpanded = anyCollapsed;
+		}
+		st.tui?.requestRender();
+		ctx.ui.notify(
+			anyCollapsed ? "已展开对话中的所有多行用户输入" : "已折叠对话中的所有多行用户输入",
+			"info",
+		);
+	};
+
+	pi.registerCommand("fold", {
+		description: "Toggle folding/expanding pasted logs in the input box or user messages in chat",
+		handler: async (_args, ctx) => {
+			toggleFoldAction(ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+alt+f", {
+		description: "Fold or unfold pasted logs in editor / user messages in chat",
+		handler: async (ctx) => {
+			toggleFoldAction(ctx);
 		},
 	});
 
