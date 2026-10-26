@@ -757,13 +757,7 @@ export default function compactionModelExtension(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("fast-model", {
-		description: "查看或设置轻量模型 Fast Model (统一用于上下文压缩 /compact、Scout 代码探索、分支摘要)",
-		getArgumentCompletions: commandCompletions,
-		handler: fastModelCommandHandler,
-	});
-
-	pi.registerCommand("compact-model", {
-		description: "查看或设置轻量模型 (同 /fast-model)",
+		description: "查看或设置轻量模型 Fast Model (统一用于上下文压缩 /compact、Scout 代码探索、Auto Mode 安全审核)",
 		getArgumentCompletions: commandCompletions,
 		handler: fastModelCommandHandler,
 	});
