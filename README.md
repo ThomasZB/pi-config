@@ -44,25 +44,55 @@
 
 ---
 
-### 3. 🧠 项目级 + 全局双层持久记忆 & Auto Memory (`extensions/memory.ts`)
+### 3. 🧠 三层记忆与无损上下文引擎 (`memory.ts` + `session-recall.ts`)
+
+#### ① 项目级 + 全局双层持久记忆 & Auto Memory (`extensions/memory.ts`)
 - **项目记忆**：`<项目根目录>/.pi/MEMORY.md`
 - **全局记忆**：`~/.pi/agent/MEMORY.md`
 - **Claude Code 同款 Auto Memory 机制**：
-  - 模型在对话中自动记录**用户纠正/反馈（feedback）**、**非显而易见的项目构建/架构特殊约定（project）**与**个人偏好（user）**，不记录易过期的代码模块总结
+  - 模型在对话中主动记录**用户纠正/反馈（feedback）**、**非显而易见的项目构建/架构特殊约定（project）**与**个人偏好（user）**，不记录易过期的代码模块总结
   - **200 行 / 25KB 启动加载上限**：每次新会话仅加载前 200 行（或 25KB），写入自动去重，接近或超出上限时自动提醒模型合并精简旧条目
+
+#### ② 无损历史回溯 + 跨会话项目连续性 + Cache-Aware 微压缩 (`extensions/session-recall.ts`)
+- **跨会话项目连续性（Cross-Session Continuity）**：
+  - 自动索引同一项目目录（`cwd`）下最近的多个历史会话摘要（首尾问题 + 会话 ID）注入 `<project_session_continuity>`
+  - 当你新开窗口说“继续之前的工作”或询问上次改了什么时，模型会自动调用 `session_recall(session_id: "previous" | scope: "project")` 检索或读取历史会话记录
+- **Compact 后无损原文回溯（Post-Compaction Recall）**：
+  - 当会话触发 `/compact` 或自动压缩后，自动生成确定性的 `#1..#N` 压缩前历史时间线目录，模型需要具体报错、行号或代码细节时可随时按 `#seq` 精确调取原始记录，彻底解决压缩失忆问题
+- **保护缓存命中率的微压缩（Cache-Aware Micro-Compaction）**：
+  - **热缓存期间零扰动**：连续对话时（空闲 `< 6` 分钟且旧工具输出未超 `30k` tokens）绝不修改历史消息，100% 保护云端 Prompt Cache 命中率
+  - **趁缓存过期免费瘦身**：当你离开 ≥ 6 分钟再发消息（云端 5 分钟缓存已自然过期）或旧工具堆积超 `30k` tokens 时，自动把距离当前 > 6 步的大体积旧工具输出（`read` / `bash` / `grep` / `codemode` / `web_fetch`）折叠为 `[Head 10 行 + Tail 8 行 + #seq 回溯指针]`，大幅削减重传 Token 成本
 
 ---
 
-### 4. 🛠️ 精选高频扩展与主/轻量双层模型架构
+### 4. ⚡ 主模型 / 轻量模型双层架构与 `scout` 探索分流 (`compaction-model.ts` + `subagent/` + `permission-gate.ts`)
+- **统一轻量模型 (`/fast-model`)**：
+  - 对标 Claude Code 的双模型设计：平时编码用主模型（`/model`），高频辅助任务统一配置一个便宜快速的轻量模型（`/fast-model`，如 Haiku / Flash，默认强制 `thinking: off`）
+  - **一处配置，四处共用**：
+    1. **上下文压缩**（`/compact` 与自动压缩）
+    2. **代码库探索子 Agent**（`scout` / Explore）
+    3. **敏感命令安全审核**（`permission-gate.ts` 的 Auto Mode）
+    4. **分支历史摘要**（`/tree` 切换分支时）
+- **`scout` (Explore) 轻量探索子 Agent**：
+  - 当主模型需要跨多文件搜索或理清未知调用链时，自动派发给 `scout` 在隔离上下文中探索（支持多任务并行 `tasks`），主对话只接收几百 Token 的 `{文件 + 行号 + 核心签名}` 浓缩结论
+  - 子进程自动以极速模式启动（`--no-extensions --no-mcp --no-context-files`），并内置 `codemode` 支持单轮批量检索
+
+---
+
+### 5. 🛠️ 全部内置扩展、Subagents 与工作流模板一览
 | 扩展 / 模块 | 功能说明 |
 | :--- | :--- |
-| `compaction-model.ts` | **统一轻量模型配置 (`/fast-model`)**：对标 Claude Code 的主模型（`/model`）+ 轻量模型（`/fast-model`，如 Haiku / Flash）双层架构。配一次自动接管：**上下文压缩 (`/compact`)**、**代码探索子 Agent (`scout`)**、**分支摘要 (`/tree`)** 与 **Auto Mode 安全审核** |
-| `subagent/` + `agents/*.md` | **多子智能体委派与 `scout` (Explore) 自动分流**：当主模型需要跨多文件搜索或理清未知模块调用链时，自动派发给绑定轻量模型、极速无扩展启动（`--no-extensions --no-context-files`）且支持 `codemode` 批量检索的 `scout` 子进程，仅将浓缩结论返回主上下文 |
-| `session-recall.ts` | 压缩前历史回溯 + 同项目跨会话记忆召回 + **Cache-Aware 微压缩**（`session_recall` + `/recall`），默认空闲 ≥ 6 分钟趁缓存过期自动为旧大工具输出瘦身，并支持随时按 `#seq` 无损翻查原文 |
-| `permission-gate.ts` | **Claude Code 风格 Auto Mode 智能安全审核 (`/auto-mode`)**：日常命令 0ms 直通；遇到 `rm -rf`、`git reset --hard`、`sudo` 等敏感命令时，自动结合当前工作目录与用户最近对话意图交由 `/fast-model` 秒级审核，项目内合规清理自动放行，越界或未知高危操作弹窗确认（`rm -rf /`、`~`、`.git` 等绝对红线强制拦截） |
+| `pretty-ui.ts` | 24-bit 流光呼吸灯、连续工具折叠、Write/Edit 独立 Diff 卡片、长粘贴/长输入折叠、富文本 Markdown、Compact 历史保留 |
+| `pretty-footer.ts` | 双行炫彩遥测状态栏 + `/context` 上下文 Token 拆解与微压缩省流统计面板 |
+| `session-recall.ts` | 压缩前 `#seq` 原文回溯 + 同项目跨会话历史检索 + Cache-Aware 微压缩（`session_recall` 工具 + `/recall` 命令） |
+| `compaction-model.ts` | 统一轻量模型配置（`/fast-model`），自动驱动压缩、`scout` 探索、分支摘要与 Auto Mode |
+| `memory.ts` | 项目级（`.pi/MEMORY.md`）+ 全局（`~/.pi/agent/MEMORY.md`）持久记忆与 Auto Memory（200 行上限） |
+| `subagent/` + `agents/*.md` | 4 个专职子智能体：`scout`（轻量只读探索）、`planner`（架构规划）、`worker`（独立上下文执行）、`reviewer`（代码审查） |
+| `prompts/*.md` | 3 个组合工作流模板命令：`/scout-and-plan`（探索+规划）、`/implement`（探索+规划+实现）、`/implement-and-review`（实现+审查） |
+| `permission-gate.ts` | Claude Code 风格 **Auto Mode 智能安全审核 (`/auto-mode`)**：结合工作目录与用户意图由 `/fast-model` 自动放行项目内合规清理，拦截越界或高危未知命令 |
 | `plan-mode/` | 只读探索规划模式（`/plan`、`Ctrl+Alt+P`、`/plan-todos`） |
 | `web.ts` | 原生联网搜索与网页抓取工具（`web_search` + `web_fetch`，基于 DeepSeek Search/Fetch API，支持 Tavily / 直连自动兜底） |
-| `questionnaire.ts` | 结构化多选/Tab 交互提问工具 |
+| `questionnaire.ts` | 结构化多选/Tab 交互提问工具（`questionnaire`） |
 | `todo.ts` | 会话内任务看板工具与 `/todos` 命令 |
 | `handoff.ts` | `/handoff <目标>` 提炼当前上下文并无缝开启新会话 |
 | `git-checkpoint.ts` | 每轮修改前自动创建 `git stash` 检查点，`/fork` 时可一键回滚代码 |
@@ -73,7 +103,7 @@
 
 ---
 
-### 5. 🎨 三套精选无底色污染主题 (`themes/`)
+### 6. 🎨 三套精选无底色污染主题 (`themes/`)
 - `tokyo-night`（深邃蓝紫暗色主题）
 - `catppuccin-mocha`（柔和暖调暗色主题）
 - `catppuccin-latte`（清爽护眼亮色主题）
@@ -129,5 +159,9 @@ pi install git+https://github.com/ThomasZB/pi-config.git
 | `/memory` | 查看当前生效记忆（`/memory edit` 打开编辑器修改） |
 | `/plan` (`Ctrl+Alt+P`) | 切换只读规划模式（Plan Mode） |
 | `/todos` | 查看当前 Todo 列表 |
+| `/shell <命令>` | 打开原生交互式终端执行命令（如 `vim`、`htop`） |
+| `/scout-and-plan <任务>` | 启动 `scout` 探索代码库并交由 `planner` 生成实施计划 |
+| `/implement <任务>` | 自动串联 `scout -> planner -> worker` 完成探索、规划与代码实现 |
+| `/implement-and-review <任务>` | 自动串联 `worker -> reviewer` 完成代码实现与独立审查 |
 | `/handoff <目标>` | 将当前会话上下文提炼移交到新会话 |
 | `/tree` | 打开完整会话历史树（支持全文搜索与回溯分支） |
