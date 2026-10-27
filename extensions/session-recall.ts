@@ -560,7 +560,7 @@ function evaluateAndStageMicroCompaction(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	config: MicroCompactionConfig,
-	force = false,
+	mode: "turn_start" | "mid_turn" | "manual" = "turn_start",
 ): {
 	triggered: boolean;
 	reason?: string;
@@ -569,6 +569,7 @@ function evaluateAndStageMicroCompaction(
 	savedTokensApprox: number;
 	gapMinutes: number;
 } {
+	const force = mode === "manual";
 	if (!config.enabled && !force) {
 		return { triggered: false, count: 0, savedChars: 0, savedTokensApprox: 0, gapMinutes: 0 };
 	}
@@ -612,25 +613,31 @@ function evaluateAndStageMicroCompaction(
 	const gapMinutes =
 		lastAssistantTimestampMs > 0 ? (Date.now() - lastAssistantTimestampMs) / 60000 : 0;
 
-	// Count how many assistant steps occur AFTER each branch index.
-	// Using assistant/tool steps (rather than user messages) ensures that a single user turn
-	// with 25+ tool calls still cleans up steps 1..19 once they are >= keepRecentToolSteps behind!
+	// Count how many assistant steps and user turns occur AFTER each branch index.
 	const assistantStepsAfter = new Array<number>(branch.length).fill(0);
+	const userTurnsAfter = new Array<number>(branch.length).fill(0);
 	let seenAssistantSteps = 0;
+	let seenUserTurns = mode === "turn_start" ? 1 : 0;
 	for (let i = branch.length - 1; i >= startIdx; i--) {
 		assistantStepsAfter[i] = seenAssistantSteps;
+		userTurnsAfter[i] = seenUserTurns;
 		const e = branch[i]!;
-		if (e.type === "message" && (e as any).message?.role === "assistant") {
-			seenAssistantSteps++;
+		if (e.type === "message") {
+			const role = (e as any).message?.role;
+			if (role === "assistant") seenAssistantSteps++;
+			else if (role === "user") seenUserTurns++;
 		}
 	}
 
-	const minStepsToKeep = force ? 2 : config.keepRecentToolSteps;
 	const candidates: PinnedMicroEdit[] = [];
 	let totalSavableChars = 0;
 	let totalSavableImageTokens = 0;
 
 	for (let i = startIdx; i < branch.length; i++) {
+		// Tool results from previous completed user turns only need 1 assistant step after them;
+		// tool results inside the currently executing turn keep `keepRecentToolSteps` (6) intact.
+		const minStepsToKeep =
+			force || userTurnsAfter[i]! > 0 ? 1 : config.keepRecentToolSteps;
 		if (assistantStepsAfter[i]! < minStepsToKeep) {
 			continue;
 		}
@@ -689,8 +696,10 @@ function evaluateAndStageMicroCompaction(
 	const estimatedSavableTokens =
 		Math.round(totalSavableChars / 3.2) + totalSavableImageTokens;
 	const cacheExpiredTrigger =
-		config.cacheTtlMinutes > 0 && gapMinutes >= config.cacheTtlMinutes;
-	const thresholdTrigger = estimatedSavableTokens >= config.clearAtLeastTokens;
+		mode === "turn_start" && config.cacheTtlMinutes > 0 && gapMinutes >= config.cacheTtlMinutes;
+	const requiredTokens =
+		mode === "mid_turn" ? config.clearAtLeastTokens * 2 : config.clearAtLeastTokens;
+	const thresholdTrigger = estimatedSavableTokens >= requiredTokens;
 
 	if (!force && !cacheExpiredTrigger && !thresholdTrigger) {
 		return { triggered: false, count: 0, savedChars: 0, savedTokensApprox: 0, gapMinutes };
@@ -1376,6 +1385,9 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 	//    footer is always the 100% accurate real API token count and never bounces!
 	pi.on("context", async (event, ctx) => {
 		ensureHydratedFromBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId());
+		// Emergency mid-turn circuit breaker: only triggers if a single turn accumulates >= 2x threshold (60k tokens)
+		const mcConfig = resolveMicroCompactionConfig(ctx.cwd);
+		evaluateAndStageMicroCompaction(pi, ctx, mcConfig, "mid_turn");
 		if (pinnedEditsByCallId.size === 0) return;
 
 		const messages = event.messages;
@@ -1412,7 +1424,7 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 	//    - Injects memoized `<compacted_history_recall>` and `<project_session_continuity>` into systemPrompt
 	pi.on("before_agent_start", async (event, ctx) => {
 		const mcConfig = resolveMicroCompactionConfig(ctx.cwd);
-		const mcResult = evaluateAndStageMicroCompaction(pi, ctx, mcConfig, false);
+		const mcResult = evaluateAndStageMicroCompaction(pi, ctx, mcConfig, "turn_start");
 		if (mcResult.triggered) {
 			ctx.ui.notify(
 				`🧹 已自动微压缩 ${mcResult.count} 条旧工具输出 (预计节省 ~${mcResult.savedTokensApprox.toLocaleString()} tokens，触发原因: ${mcResult.reason}，原文可通过 session_recall 无损查阅)`,
@@ -1555,7 +1567,7 @@ export default function sessionRecallExtension(pi: ExtensionAPI): void {
 
 			// `/recall compact`
 			if (raw.toLowerCase() === "compact") {
-				const res = evaluateAndStageMicroCompaction(pi, ctx, config, true);
+				const res = evaluateAndStageMicroCompaction(pi, ctx, config, "manual");
 				if (!res.triggered) {
 					ctx.ui.notify("当前没有需要微压缩的超大旧工具输出（上下文已处于精简状态）", "info");
 				} else {

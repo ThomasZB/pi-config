@@ -763,9 +763,10 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet:
 			"Delegate codebase exploration (scout), planning (planner), review (reviewer), or isolated tasks (worker) to subagents with isolated context",
 		promptGuidelines: [
-			"When exploring an unfamiliar codebase, tracing call chains across multiple files, or locating where a feature is implemented without knowing the exact file path, delegate to `subagent` with `agent: \"scout\"` (specify thoroughness: quick, medium, or thorough) instead of reading many files into the main context.",
+			"Whenever a task requires understanding how a feature works across multiple modules/layers (e.g. backend + frontend) or reading more than 3 files—even if you already know the project or found file names via `grep`—delegate the reconnaissance to `subagent` with `agent: \"scout\"` (specify thoroughness: quick, medium, or thorough) first.",
+			"NEVER use `codemode` (`Promise.allSettled([tools.read(...), ...])`) or repeated `read` calls to bulk-read >3 source files into the main context; use `scout` so bulk file reading stays in an isolated subagent context and only a concise summary with exact file paths and line ranges enters the main context.",
 			"When investigating 2+ independent areas or modules, launch parallel `scout` subagents in a single call (`tasks: [...]`).",
-			"Do NOT spawn a subagent for trivial lookups when you already know the target file path or only need 1-2 quick `grep`/`read` calls—use direct tools when delegation overhead exceeds the work.",
+			"Only skip `scout` and use direct `read`/`grep` when the task is localized to 1-3 specific files.",
 		],
 		parameters: SubagentParams,
 
